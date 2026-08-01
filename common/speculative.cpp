@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1716,6 +1717,14 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     std::vector<float>   bias;     // Markov scratch (full vocab size; top-K path uses first K)
     std::vector<int32_t> cand_idx; // top-K candidate selection scratch
 
+    // rolling-acceptance gate (see ctor comment)
+    float   gate_min   = 0.0f;
+    int32_t gate_probe = 8;
+    int32_t draft_len  = 0;    // max positions submitted per block (block computes all n_spec)
+    float   conf_min   = 0.0f; // per-position emit-confidence cutoff (0 = disabled)
+    std::vector<float>   gate_ema;  // per-seq EMA of accepted tokens per drafted cycle
+    std::vector<int32_t> gate_skip; // per-seq cycles skipped since the last probe
+
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1763,6 +1772,22 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         // cycle (~21 ms each on thelio-astra) dwarf the drafter's actual compute.
         llama_set_causal_attn(ctx_dft, false);
 
+        // emit-policy knobs, all measured on thelio-astra's 5-prompt set (2026-08-01):
+        //   draft_len 3 is the sweep winner (mean 15.54 t/s vs 13.74 at 5, 14.30 at 4;
+        //     wins or ties every prompt class vs both longer lengths).
+        //   gate (EMA acceptance gate, gate_min > 0 enables): every variant tried lost
+        //     to plain len-3 — helps prose less than len-3 does and costs code prompts.
+        //   conf_min (per-position confidence cutoff): raw-logit softmax confidence is
+        //     miscalibrated vs actual acceptance (worst exactly where acceptance is
+        //     highest); 0.3/0.5 both lost to len-3. Off by default.
+        gate_min   = getenv("DSPARK_GATE_MIN")   ? (float) atof(getenv("DSPARK_GATE_MIN"))  : 0.0f;
+        gate_probe = getenv("DSPARK_GATE_PROBE") ? std::max(1, atoi(getenv("DSPARK_GATE_PROBE"))) : 8;
+        draft_len  = getenv("DSPARK_DRAFT_LEN")  ? std::max(1, atoi(getenv("DSPARK_DRAFT_LEN"))) : std::min(3, n_spec);
+        conf_min   = getenv("DSPARK_CONF_MIN")   ? (float) atof(getenv("DSPARK_CONF_MIN"))  : 0.0f;
+        gate_ema.assign(n_seq, (float) n_spec);
+        gate_skip.assign(n_seq, 0);
+        SPC_TRC("- gate_min=%.2f, gate_probe=%d, draft_len=%d, conf_min=%.2f\n", gate_min, gate_probe, draft_len, conf_min);
+
         bias.resize(llama_vocab_n_tokens(llama_model_get_vocab(mdl_dft)));
     }
 
@@ -1772,8 +1797,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        GGML_UNUSED(seq_id);
         GGML_UNUSED(prompt);
+        // new request: reopen the gate optimistically
+        gate_ema [seq_id] = (float) n_spec;
+        gate_skip[seq_id] = 0;
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -1833,6 +1860,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 continue;
             }
 
+            if (gate_min > 0.0f && gate_ema[seq_id] < gate_min) {
+                if (++gate_skip[seq_id] < gate_probe) {
+                    continue; // gated: let the target decode normally this cycle
+                }
+                gate_skip[seq_id] = 0; // periodic probe — acceptance may have recovered
+            }
+
             common_batch_clear(batch_block);
             for (int k = 0; k < n_spec; ++k) {
                 const llama_token tok = k == 0 ? dp.id_last : noise_tok;
@@ -1852,7 +1886,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             auto & result = *dp.result;
             llama_token prev = dp.id_last;
 
-            const int n_draft = std::min((int) params.n_max, n_spec);
+            // the block decode always computes all n_spec positions (fixed graph shape),
+            // but tail positions have low acceptance (measured /pos: 0.75, 0.49, 0.34,
+            // 0.25, 0.20) — submitting them widens the target's verify batch for less
+            // expected yield than its marginal cost. draft_len caps what we EMIT.
+            const int n_draft = std::min(std::min((int) params.n_max, n_spec), draft_len);
             for (int k = 0; k < n_draft; ++k) {
                 const float * logits = llama_get_logits_ith(ctx_dft, k);
                 if (logits == nullptr) {
@@ -1885,6 +1923,24 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                         best   = (llama_token) cand_idx[j];
                     }
                 }
+
+                // confidence cutoff: the emitted token's raw-logit softmax mass over the
+                // top-K candidates approximates the chance the target agrees. Positions
+                // the drafter is unsure about widen the verify batch for negative
+                // expected value, so stop emitting at the first low-confidence position
+                // (always emit at least one).
+                if (conf_min > 0.0f && k > 0) {
+                    const float l_max = logits[cand_idx[0]];
+                    float sum = 0.0f;
+                    for (int j = 0; j < n_cand; ++j) {
+                        sum += expf(logits[cand_idx[j]] - l_max);
+                    }
+                    const float conf = expf(logits[best] - l_max) / sum;
+                    if (conf < conf_min) {
+                        break;
+                    }
+                }
+
                 SPC_DBG(" - seq_id %d, dspark draft pos %3d: %6d '%s'\n",
                         seq_id, k, best, common_token_to_piece(ctx_dft, best).c_str());
                 result.push_back(best);
@@ -1901,9 +1957,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
-        GGML_UNUSED(seq_id);
-        GGML_UNUSED(n_accepted);
-        GGML_UNUSED(is_other);
+        if (is_other) {
+            return; // another impl's draft — no signal about ours
+        }
+        gate_ema[seq_id] = 0.8f * gate_ema[seq_id] + 0.2f * (float) n_accepted;
+        // note: an asymmetric instant-reopen on strong probes (n_accepted >= 3) was tried
+        // and measured WORSE on the 5-prompt set — prose hits lucky probes often enough
+        // to reopen into failing stretches. Keep the symmetric EMA.
     }
 
     bool need_embd() const override {
