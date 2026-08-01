@@ -550,7 +550,8 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
-        if (self_v_idxs) {
+        // v_idxs can stay unallocated even when k_idxs is live (MLA graphs read K only)
+        if (self_v_idxs && self_v_idxs->buffer) {
             mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
         }
     }
@@ -563,7 +564,8 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
         mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
-        if (self_v_idxs_swa) {
+        // v_idxs can stay unallocated even when k_idxs is live (MLA graphs read K only)
+        if (self_v_idxs_swa && self_v_idxs_swa->buffer) {
             mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
         }
     }
