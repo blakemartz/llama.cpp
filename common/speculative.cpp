@@ -1756,6 +1756,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn_taps(ctx_tgt, n_taps);
 
+        // the drafter context is permanently non-causal: the ingest graph writes K/V with
+        // no attention compute (causality irrelevant) and the noise-block decode is
+        // bidirectional by design. Toggling causality per block decode instead flags
+        // sched_need_reserve on every flip, and the two full sched reserves per draft
+        // cycle (~21 ms each on thelio-astra) dwarf the drafter's actual compute.
+        llama_set_causal_attn(ctx_dft, false);
+
         bias.resize(llama_vocab_n_tokens(llama_model_get_vocab(mdl_dft)));
     }
 
@@ -1832,11 +1839,8 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 common_batch_add(batch_block, tok, dp.n_past + k, { seq_id }, true);
             }
 
-            // the whole block is bidirectional; the drafter context is separate from the
-            // target so toggling causality here affects nothing else
-            llama_set_causal_attn(ctx_dft, false);
+            // the drafter context is permanently non-causal (set once in the ctor)
             const int32_t rc = llama_decode(ctx_dft, batch_block);
-            llama_set_causal_attn(ctx_dft, true);
 
             if (rc != 0) {
                 SPC_ERR("dspark block decode failed rc=%d\n", (int) rc);
