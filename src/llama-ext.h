@@ -109,6 +109,11 @@ LLAMA_API llama_token llama_model_dspark_noise_token(const struct llama_model * 
 // First call lazily dequantizes markov_w2 to a CPU cache (~n_vocab*rank floats).
 LLAMA_API bool llama_model_dspark_markov_bias(const struct llama_model * model, llama_token prev, float * dst);
 
+// Same, but only for the n_idxs candidate tokens in idxs; dst[j] = bias(idxs[j]).
+// ~vocab/K cheaper than the full-vocab variant; used by the drafter's hot path.
+LLAMA_API bool llama_model_dspark_markov_bias_topk(const struct llama_model * model, llama_token prev,
+        const int32_t * idxs, int32_t n_idxs, float * dst);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

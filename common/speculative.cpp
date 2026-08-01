@@ -1713,7 +1713,8 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     int32_t n_spec = 0;
     llama_token noise_tok = 0;
 
-    std::vector<float> bias; // [n_vocab] Markov scratch
+    std::vector<float>   bias;     // Markov scratch (full vocab size; top-K path uses first K)
+    std::vector<int32_t> cand_idx; // top-K candidate selection scratch
 
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -1788,21 +1789,27 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
         // ingest the trunk tap rows into the drafter's context KV ring at the SAME
         // positions (no +1 shift, no outputs). the ingest graph consumes only embd+pos.
-        common_batch_clear(batch_ingest);
-        for (int k = 0; k < batch_in.n_tokens; ++k) {
-            const int i = batch_ingest.n_tokens;
-            batch_ingest.pos     [i]    = batch_in.pos[k];
-            batch_ingest.n_seq_id[i]    = 1;
-            batch_ingest.seq_id  [i][0] = batch_in.seq_id[k][0];
-            batch_ingest.logits  [i]    = 0;
-            std::memcpy(batch_ingest.embd + (size_t) i * n_embd, h_tgt + (size_t) k * n_embd, row_bytes);
-            batch_ingest.n_tokens++;
-        }
+        // the drafter's batch is clamped smaller than the target's, so chunk.
+        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        for (int k0 = 0; k0 < batch_in.n_tokens; k0 += n_b) {
+            const int n_chunk = std::min(n_b, batch_in.n_tokens - k0);
 
-        const int32_t rc = llama_decode(ctx_dft, batch_ingest);
-        if (rc != 0) {
-            SPC_ERR("dspark ingest decode failed rc=%d (pos=%d)\n", (int) rc, (int) batch_in.pos[0]);
-            return false;
+            common_batch_clear(batch_ingest);
+            for (int k = k0; k < k0 + n_chunk; ++k) {
+                const int i = batch_ingest.n_tokens;
+                batch_ingest.pos     [i]    = batch_in.pos[k];
+                batch_ingest.n_seq_id[i]    = 1;
+                batch_ingest.seq_id  [i][0] = batch_in.seq_id[k][0];
+                batch_ingest.logits  [i]    = 0;
+                std::memcpy(batch_ingest.embd + (size_t) i * n_embd, h_tgt + (size_t) k * n_embd, row_bytes);
+                batch_ingest.n_tokens++;
+            }
+
+            const int32_t rc = llama_decode(ctx_dft, batch_ingest);
+            if (rc != 0) {
+                SPC_ERR("dspark ingest decode failed rc=%d (pos=%d)\n", (int) rc, (int) batch_ingest.pos[0]);
+                return false;
+            }
         }
 
         return true;
@@ -1847,15 +1854,31 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 if (logits == nullptr) {
                     break;
                 }
-                const bool has_bias = llama_model_dspark_markov_bias(mdl_dft, prev, bias.data());
 
-                llama_token best = 0;
+                // the Markov bias can only flip the argmax between candidates whose raw
+                // logits are within the bias magnitude of the top — restrict the bias
+                // GEMV to the top-K raw-logit candidates instead of the full vocab
+                constexpr int K = 512;
+                const int n_vocab = (int) bias.size();
+                const int n_cand  = std::min(K, n_vocab);
+
+                cand_idx.resize(n_vocab);
+                for (int v = 0; v < n_vocab; ++v) {
+                    cand_idx[v] = v;
+                }
+                std::partial_sort(cand_idx.begin(), cand_idx.begin() + n_cand, cand_idx.end(),
+                        [logits](int32_t a, int32_t b) { return logits[a] > logits[b]; });
+
+                const bool has_bias = llama_model_dspark_markov_bias_topk(
+                        mdl_dft, prev, cand_idx.data(), n_cand, bias.data());
+
+                llama_token best = cand_idx[0];
                 float best_v = -INFINITY;
-                for (size_t v = 0; v < bias.size(); ++v) {
-                    const float x = logits[v] + (has_bias ? bias[v] : 0.0f);
+                for (int j = 0; j < n_cand; ++j) {
+                    const float x = logits[cand_idx[j]] + (has_bias ? bias[j] : 0.0f);
                     if (x > best_v) {
                         best_v = x;
-                        best   = (llama_token) v;
+                        best   = (llama_token) cand_idx[j];
                     }
                 }
                 SPC_DBG(" - seq_id %d, dspark draft pos %3d: %6d '%s'\n",
@@ -2538,6 +2561,16 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->model.reset(model_dft);
+
+        if (llama_model_dspark_block_size(model_dft) > 0) {
+            // DSpark sidecar: the drafter never needs the target's batch size — ingest is
+            // chunked by the driver and the block decode is n_spec tokens. A small batch
+            // shrinks the drafter's compute buffer ~8x so it coexists with GPU expert pins.
+            cparams.n_batch  = std::min(cparams.n_batch,  512u);
+            cparams.n_ubatch = std::min(cparams.n_ubatch, 512u);
+            LOG_INF("%s: DSpark sidecar detected, clamping draft n_batch/n_ubatch to %u/%u\n",
+                    __func__, cparams.n_batch, cparams.n_ubatch);
+        }
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
