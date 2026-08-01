@@ -479,6 +479,14 @@ class DeepseekV4Model(TextModel):
     _skipped_mtp_tensors = 0
     _dsv4_main_layers: int | None = None
     _dsv4_nextn_layers: int = 0
+    # DSpark ("DeepSeek-V4-Flash" 3-stage MTP drafter) detection. config.json's
+    # num_nextn_predict_layers is a vestigial single-MTP-head field that DSpark
+    # checkpoints under-report (it's stuck at 1 even though 3 mtp.N.* stages are
+    # present) - see _scan_dsv4_mtp_metadata(). _dsv4_is_dspark gates the handful
+    # of DSpark-only tensor renames (main_proj/main_norm/markov_head/head_norm/
+    # drafter-owned hc_head, confidence_head drop) that don't apply to the older
+    # single-MTP-layer DeepSeek-V4 convention this class also still supports.
+    _dsv4_is_dspark: bool = False
 
     def __init__(self, *args, **kwargs):
         type(self)._skipped_mtp_tensors = 0
@@ -491,7 +499,11 @@ class DeepseekV4Model(TextModel):
 
         self.block_count = self.hparams["num_hidden_layers"]
         if self.mtp_only:
-            self.block_count += self.hparams.get("num_nextn_predict_layers", 0)
+            # Use the tensor-index-detected stage count (index_tensors(), already
+            # run by super().__init__() above), not the raw hparams field - see
+            # _scan_dsv4_mtp_metadata() for why the hparams field can't be trusted
+            # for DSpark checkpoints.
+            self.block_count += type(self)._dsv4_nextn_layers
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
         self._dsv4_fp8_dequantized: set[str] = set()
@@ -511,8 +523,49 @@ class DeepseekV4Model(TextModel):
 
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         type(self)._dsv4_main_layers = self.hparams["num_hidden_layers"]
-        type(self)._dsv4_nextn_layers = self.hparams.get("num_nextn_predict_layers", 0)
+
+        nextn_layers = self.hparams.get("num_nextn_predict_layers", 0)
+        detected_stages, is_dspark = self._scan_dsv4_mtp_metadata()
+        if detected_stages > nextn_layers:
+            logger.info(
+                "DeepSeek-V4 config.json reports num_nextn_predict_layers=%d but %d "
+                "mtp.N.* stage(s) are present in the tensor index; trusting the tensor "
+                "index (config field is vestigial for DSpark-style checkpoints)",
+                nextn_layers, detected_stages,
+            )
+            nextn_layers = detected_stages
+
+        type(self)._dsv4_nextn_layers = nextn_layers
+        type(self)._dsv4_is_dspark = is_dspark
+        if is_dspark:
+            logger.info("Detected DSpark-style DeepSeek-V4 MTP checkpoint (%d stages)", nextn_layers)
+
         return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+    def _scan_dsv4_mtp_metadata(self) -> tuple[int, bool]:
+        """Scan the local safetensors weight map (without loading any tensor data)
+        for the real mtp.N.* stage count and whether this is a DSpark-style
+        checkpoint (stage-0 main_proj / stage-N markov_head present), since
+        config.json's num_nextn_predict_layers cannot be trusted for DSpark (see
+        class docstring comment above _dsv4_is_dspark)."""
+        index_file = self.dir_model / "model.safetensors.index.json"
+        if not index_file.is_file():
+            return 0, False
+
+        with open(index_file, "r", encoding="utf-8") as f:
+            weight_map = json.load(f).get("weight_map", {})
+
+        stages: set[int] = set()
+        is_dspark = False
+        for name in weight_map.keys():
+            match = re.match(r"mtp\.(\d+)\.", name)
+            if match is None:
+                continue
+            stages.add(int(match.group(1)))
+            if name.endswith("main_proj.weight") or ".markov_head." in name:
+                is_dspark = True
+
+        return (max(stages) + 1) if stages else 0, is_dspark
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
@@ -533,13 +586,47 @@ class DeepseekV4Model(TextModel):
 
             bid = cls._dsv4_main_layers + mtp_idx
             suffix = parts[2]
+            is_last_stage = mtp_idx == cls._dsv4_nextn_layers - 1
+
+            if cls._dsv4_is_dspark and suffix.startswith("confidence_head."):
+                # Not wired into inference by the reference implementation either
+                # (vLLM's dspark.py loader drops it too, unconditionally) - v1
+                # scope drops it entirely rather than exporting dead weights.
+                cls._skipped_mtp_tensors += 1
+                return None
+
             root_hc_head = {
                 "hc_head_fn",
                 "hc_head_base",
                 "hc_head_scale",
             }
-            if suffix in root_hc_head:
+            dspark_root_hc_head = {
+                "hc_head_fn": "nextn.hc_head_fn",
+                "hc_head_base": "nextn.hc_head_base",
+                "hc_head_scale": "nextn.hc_head_scale",
+            }
+            if cls._dsv4_is_dspark and suffix in root_hc_head:
+                # DSpark's drafter owns its final hc-reduce; keep it distinct from
+                # the trunk's own root hc_head_* (the older single-MTP-layer
+                # convention below intentionally aliases the trunk's instead).
+                name = dspark_root_hc_head[suffix]
+            elif suffix in root_hc_head:
                 name = suffix
+            elif cls._dsv4_is_dspark and suffix == "main_proj.weight":
+                name = f"layers.{bid}.nextn.main_proj.weight"
+            elif cls._dsv4_is_dspark and suffix == "main_proj.scale":
+                name = f"layers.{bid}.nextn.main_proj.scale"
+            elif cls._dsv4_is_dspark and suffix == "main_norm.weight":
+                name = f"layers.{bid}.nextn.main_norm.weight"
+            elif cls._dsv4_is_dspark and suffix == "markov_head.markov_w1.weight":
+                name = "nextn.markov_w1.weight"
+            elif cls._dsv4_is_dspark and suffix == "markov_head.markov_w2.weight":
+                name = "nextn.markov_w2.weight"
+            elif cls._dsv4_is_dspark and suffix == "norm.weight" and is_last_stage:
+                # DSpark's final pre-head norm applies once, after all 3 stages -
+                # root-scoped, distinct from the per-block nextn.shared_head_norm
+                # the older single-MTP-layer convention maps to below.
+                name = "nextn.head_norm.weight"
             elif suffix in (
                 "e_proj.weight", "e_proj.scale",
                 "h_proj.weight", "h_proj.scale",
@@ -621,8 +708,16 @@ class DeepseekV4Model(TextModel):
         self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
         self.gguf_writer.add_hash_layer_count(hparams["num_hash_layers"])
         self.gguf_writer.add_embedding_length_out(hparams["hidden_size"] * hparams["hc_mult"])
-        if self.mtp_only and (num_nextn_predict_layers := hparams.get("num_nextn_predict_layers", 0)) > 0:
-            self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
+        if self.mtp_only and type(self)._dsv4_nextn_layers > 0:
+            # index-detected count (see _scan_dsv4_mtp_metadata), not the raw
+            # hparams field - for DSpark checkpoints these differ (1 vs 3).
+            self.gguf_writer.add_nextn_predict_layers(type(self)._dsv4_nextn_layers)
+
+        if self.mtp_only and type(self)._dsv4_is_dspark:
+            self.gguf_writer.add_dspark_target_layer_ids(hparams["dspark_target_layer_ids"])
+            self.gguf_writer.add_dspark_noise_token_id(hparams["dspark_noise_token_id"])
+            self.gguf_writer.add_dspark_block_size(hparams["dspark_block_size"])
+            self.gguf_writer.add_dspark_markov_rank(hparams["dspark_markov_rank"])
 
     def dequant_model(self):
         fp8_dtypes = self._float8_dtypes()
@@ -775,6 +870,14 @@ class DeepseekV4Model(TextModel):
             "hc_head_fn": (gguf.MODEL_TENSOR.HC_HEAD_FN, ".weight"),
             "hc_head_base": (gguf.MODEL_TENSOR.HC_HEAD_BASE, ".weight"),
             "hc_head_scale": (gguf.MODEL_TENSOR.HC_HEAD_SCALE, ".weight"),
+            # DSpark sidecar root-level tensors (drafter-owned, distinct from the
+            # trunk's own hc_head_*/norm.weight above)
+            "nextn.hc_head_fn": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_FN, ".weight"),
+            "nextn.hc_head_base": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_BASE, ".weight"),
+            "nextn.hc_head_scale": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_SCALE, ".weight"),
+            "nextn.head_norm.weight": (gguf.MODEL_TENSOR.NEXTN_HEAD_NORM, ".weight"),
+            "nextn.markov_w1.weight": (gguf.MODEL_TENSOR.NEXTN_MARKOV_W1, ".weight"),
+            "nextn.markov_w2.weight": (gguf.MODEL_TENSOR.NEXTN_MARKOV_W2, ".weight"),
         }
         if name in root_map:
             return root_map[name]
@@ -826,6 +929,13 @@ class DeepseekV4Model(TextModel):
             "nextn.shared_head_norm.weight": (gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM, ".weight"),
             "nextn.embed_tokens.weight": (gguf.MODEL_TENSOR.NEXTN_EMBED_TOKENS, ".weight"),
             "nextn.shared_head_head.weight": (gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD, ".weight"),
+            # DSpark sidecar stage-0-only tensors (per-block, bid-scoped). Note:
+            # main_proj.scale never reaches here - like every other dense FP8
+            # tensor's .scale (see e.g. attn.wq_a above, also absent from this
+            # map), dequant_model() consumes and deletes it before modify_tensors
+            # runs; only the dequantized main_proj.weight survives to this point.
+            "nextn.main_proj.weight": (gguf.MODEL_TENSOR.NEXTN_MAIN_PROJ, ".weight"),
+            "nextn.main_norm.weight": (gguf.MODEL_TENSOR.NEXTN_MAIN_NORM, ".weight"),
         }
 
         tensor_name = match.group(2)
