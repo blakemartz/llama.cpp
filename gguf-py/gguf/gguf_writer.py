@@ -995,6 +995,18 @@ class GGUFWriter:
     def add_hyper_connection_epsilon(self, value: float) -> None:
         self.add_float32(Keys.HyperConnection.EPSILON.format(arch=self.arch), value)
 
+    def add_dspark_target_layer_ids(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.DSpark.TARGET_LAYER_IDS.format(arch=self.arch), values)
+
+    def add_dspark_noise_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.DSpark.NOISE_TOKEN_ID.format(arch=self.arch), value)
+
+    def add_dspark_block_size(self, value: int) -> None:
+        self.add_uint32(Keys.DSpark.BLOCK_SIZE.format(arch=self.arch), value)
+
+    def add_dspark_markov_rank(self, value: int) -> None:
+        self.add_uint32(Keys.DSpark.MARKOV_RANK.format(arch=self.arch), value)
+
     def add_attention_scale(self, value: float) -> None:
         self.add_float32(Keys.Attention.SCALE.format(arch=self.arch), value)
 

@@ -212,6 +212,12 @@ class Keys:
         SINKHORN_ITERATIONS  = "{arch}.hyper_connection.sinkhorn_iterations"
         EPSILON              = "{arch}.hyper_connection.epsilon"
 
+    class DSpark:
+        TARGET_LAYER_IDS = "{arch}.dspark.target_layer_ids"
+        NOISE_TOKEN_ID   = "{arch}.dspark.noise_token_id"
+        BLOCK_SIZE       = "{arch}.dspark.block_size"
+        MARKOV_RANK      = "{arch}.dspark.markov_rank"
+
     class Rope:
         DIMENSION_COUNT           = "{arch}.rope.dimension_count"
         DIMENSION_COUNT_SWA       = "{arch}.rope.dimension_count_swa"
@@ -986,6 +992,16 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HNORM            = auto()
     NEXTN_SHARED_HEAD_HEAD = auto()
     NEXTN_SHARED_HEAD_NORM = auto()
+    # dspark sidecar (DeepSeek-V4-Flash DSpark 3-stage MTP drafter; DEEPSEEK4-scoped,
+    # distinct from the unrelated LLM_ARCH_DFLASH "dspark" enums below)
+    NEXTN_MAIN_NORM        = auto()  # stage-0-only: norm applied to main_proj(concat[H40;H41;H42])
+    NEXTN_MAIN_PROJ        = auto()  # stage-0-only: projects concatenated trunk taps to n_embd
+    NEXTN_HEAD_NORM        = auto()  # root: drafter's own final pre-head RMSNorm (mtp.2.norm)
+    NEXTN_HC_HEAD_FN       = auto()  # root: drafter-owned head-side hyper-connection reduce
+    NEXTN_HC_HEAD_BASE     = auto()
+    NEXTN_HC_HEAD_SCALE    = auto()
+    NEXTN_MARKOV_W1        = auto()  # root: markov head prev-token embed [vocab, rank]
+    NEXTN_MARKOV_W2        = auto()  # root: markov head bias projection [vocab, rank]
     # eagle3
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
@@ -1629,6 +1645,15 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
+    # dspark sidecar (DEEPSEEK4-scoped, see MODEL_TENSOR enum comment above)
+    MODEL_TENSOR.NEXTN_MAIN_NORM:           "blk.{bid}.nextn.main_norm",
+    MODEL_TENSOR.NEXTN_MAIN_PROJ:           "blk.{bid}.nextn.main_proj",
+    MODEL_TENSOR.NEXTN_HEAD_NORM:           "nextn.head_norm",
+    MODEL_TENSOR.NEXTN_HC_HEAD_FN:          "nextn.hc_head_fn",
+    MODEL_TENSOR.NEXTN_HC_HEAD_BASE:        "nextn.hc_head_base",
+    MODEL_TENSOR.NEXTN_HC_HEAD_SCALE:       "nextn.hc_head_scale",
+    MODEL_TENSOR.NEXTN_MARKOV_W1:           "nextn.markov_w1",
+    MODEL_TENSOR.NEXTN_MARKOV_W2:           "nextn.markov_w2",
     MODEL_TENSOR.FC:                        "fc",
     MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
     MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
@@ -3336,6 +3361,14 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HNORM,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+        MODEL_TENSOR.NEXTN_MAIN_NORM,
+        MODEL_TENSOR.NEXTN_MAIN_PROJ,
+        MODEL_TENSOR.NEXTN_HEAD_NORM,
+        MODEL_TENSOR.NEXTN_HC_HEAD_FN,
+        MODEL_TENSOR.NEXTN_HC_HEAD_BASE,
+        MODEL_TENSOR.NEXTN_HC_HEAD_SCALE,
+        MODEL_TENSOR.NEXTN_MARKOV_W1,
+        MODEL_TENSOR.NEXTN_MARKOV_W2,
     ],
     MODEL_ARCH.ERNIE4_5_MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
