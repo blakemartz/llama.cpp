@@ -23,15 +23,16 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     // switches the nextn machinery into DSpark mode: no eh_proj/enorm/hnorm fusion,
     // stage-0 main_proj/main_norm instead, drafter-owned output tail + Markov head.
     {
-        std::vector<uint32_t> taps;
+        std::vector<int32_t> taps;
         ml.get_arr(LLM_KV_DSPARK_TARGET_LAYER_IDS, taps, false);
         if (!taps.empty()) {
             GGML_ASSERT(taps.size() <= hparams.dspark_tap_layer_ids.size() && "too many DSpark tap layers");
             hparams.dspark_n_taps = (uint32_t) taps.size();
             target_layer_ids.clear();
             for (size_t i = 0; i < taps.size(); ++i) {
-                hparams.dspark_tap_layer_ids[i] = taps[i];
-                target_layer_ids.push_back((int32_t) taps[i]);
+                GGML_ASSERT(taps[i] >= 0 && "negative DSpark tap layer id");
+                hparams.dspark_tap_layer_ids[i] = (uint32_t) taps[i];
+                target_layer_ids.push_back(taps[i]);
             }
             ml.get_key(LLM_KV_DSPARK_NOISE_TOKEN_ID, hparams.dspark_noise_token);
             ml.get_key(LLM_KV_DSPARK_BLOCK_SIZE,     hparams.dspark_block_size);

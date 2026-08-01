@@ -590,13 +590,12 @@ struct llama_model {
     struct ggml_tensor * hc_head_base  = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
 
-    // DSpark drafter-owned output tail + Markov head (drafter sidecar GGUFs only)
+    // DSpark drafter-owned output tail (drafter sidecar GGUFs only);
+    // markov_w1/w2 shared with the dspark block below
     struct ggml_tensor * dspark_head_norm     = nullptr;
     struct ggml_tensor * dspark_hc_head_fn    = nullptr;
     struct ggml_tensor * dspark_hc_head_base  = nullptr;
     struct ggml_tensor * dspark_hc_head_scale = nullptr;
-    struct ggml_tensor * dspark_markov_w1     = nullptr;
-    struct ggml_tensor * dspark_markov_w2     = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;
