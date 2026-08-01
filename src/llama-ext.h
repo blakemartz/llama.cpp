@@ -95,6 +95,20 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// DSpark (DeepSeek-V4-Flash-0731): make the trunk's nextn embedding the concat of the
+// last n_taps layers' outputs (mean over hyper-connection streams, zero-padded to
+// n_embd_out) instead of the final hidden state. 0 restores the default behavior.
+LLAMA_API void llama_set_embeddings_nextn_taps(struct llama_context * ctx, uint32_t n_taps);
+
+// DSpark drafter model metadata. block_size returns 0 for non-DSpark models.
+LLAMA_API int32_t     llama_model_dspark_block_size (const struct llama_model * model);
+LLAMA_API llama_token llama_model_dspark_noise_token(const struct llama_model * model);
+
+// DSpark Markov head: dst (n_vocab floats) += -style bias for the token following `prev`.
+// dst is OVERWRITTEN. Returns false if the model has no Markov head.
+// First call lazily dequantizes markov_w2 to a CPU cache (~n_vocab*rank floats).
+LLAMA_API bool llama_model_dspark_markov_bias(const struct llama_model * model, llama_token prev, float * dst);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

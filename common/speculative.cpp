@@ -1692,6 +1692,201 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+// DSpark (DeepSeek-V4-Flash-0731): block-parallel 3-layer drafter with a Markov-head
+// sequential logit bias. Selected automatically on the draft-mtp path when the sidecar
+// carries DSpark metadata. NOT the same thing as COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK
+// (that is the standalone DFlash-style block-diffusion drafter, a different architecture).
+//
+// Unlike draft-mtp there is no h-shift/pending bookkeeping: the trunk emits a per-token
+// concat of its last-n_taps layer outputs, which the drafter ingests into its own
+// sliding-window context KV at the SAME positions. Drafting then runs one non-causal
+// forward over [anchor + noise x (n_spec-1)] and samples all positions left-to-right
+// with the Markov bias (position k predicts absolute position pos_k + 1).
+struct common_speculative_impl_draft_dspark : public common_speculative_impl {
+    common_params_speculative_draft params;
+
+    llama_batch batch_ingest; // embd-only: trunk tap rows -> drafter context KV
+    llama_batch batch_block;  // token-only: [anchor, noise x (n_spec-1)]
+
+    int32_t n_embd = 0;
+    int32_t n_spec = 0;
+    llama_token noise_tok = 0;
+
+    std::vector<float> bias; // [n_vocab] Markov scratch
+
+    common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
+        , params(params.draft)
+    {
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+        GGML_ASSERT(ctx_tgt && ctx_dft && "DSpark requires ctx_tgt and ctx_dft to be set");
+
+        const llama_model * mdl_dft = llama_get_model(ctx_dft);
+
+        n_embd = llama_model_n_embd_out(mdl_dft);
+        GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
+                "DSpark input row width must match the target h_nextn width");
+
+        n_spec    = llama_model_dspark_block_size(mdl_dft);
+        noise_tok = llama_model_dspark_noise_token(mdl_dft);
+        GGML_ASSERT(n_spec > 1 && "DSpark drafter model missing dspark metadata");
+
+        const uint32_t n_taps  = llama_model_target_layer_ids_n(mdl_dft);
+        const int32_t * ids    = llama_model_target_layer_ids(mdl_dft);
+        const int32_t n_lt     = llama_model_n_layer(llama_get_model(ctx_tgt));
+        GGML_ASSERT(n_taps > 0);
+        for (uint32_t i = 0; i < n_taps; ++i) {
+            // the trunk graph taps its LAST n_taps layers; the metadata must agree
+            GGML_ASSERT(ids[i] == n_lt - (int32_t) n_taps + (int32_t) i &&
+                    "DSpark target layers must be the trunk's last n_taps layers");
+        }
+
+        SPC_TRC("%s", "adding speculative implementation 'draft-dspark'\n");
+        SPC_TRC("- n_spec=%d, noise_tok=%d, n_embd=%d, n_taps=%u\n", n_spec, (int) noise_tok, n_embd, n_taps);
+
+        this->params.n_max = std::min(this->params.n_max, n_spec);
+
+        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        batch_ingest = llama_batch_init(n_b, n_embd, 1);
+        batch_block  = llama_batch_init(n_spec, 0, 1);
+
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+        llama_set_embeddings_nextn_taps(ctx_tgt, n_taps);
+
+        bias.resize(llama_vocab_n_tokens(llama_model_get_vocab(mdl_dft)));
+    }
+
+    ~common_speculative_impl_draft_dspark() override {
+        llama_batch_free(batch_ingest);
+        llama_batch_free(batch_block);
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(prompt);
+    }
+
+    bool process(const llama_batch & batch_in) override {
+        if (batch_in.n_tokens <= 0) {
+            return true;
+        }
+        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return true;
+        }
+
+        auto * ctx_tgt = params.ctx_tgt;
+        auto * ctx_dft = params.ctx_dft;
+
+        const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+        if (h_tgt == nullptr) {
+            return true;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // ingest the trunk tap rows into the drafter's context KV ring at the SAME
+        // positions (no +1 shift, no outputs). the ingest graph consumes only embd+pos.
+        common_batch_clear(batch_ingest);
+        for (int k = 0; k < batch_in.n_tokens; ++k) {
+            const int i = batch_ingest.n_tokens;
+            batch_ingest.pos     [i]    = batch_in.pos[k];
+            batch_ingest.n_seq_id[i]    = 1;
+            batch_ingest.seq_id  [i][0] = batch_in.seq_id[k][0];
+            batch_ingest.logits  [i]    = 0;
+            std::memcpy(batch_ingest.embd + (size_t) i * n_embd, h_tgt + (size_t) k * n_embd, row_bytes);
+            batch_ingest.n_tokens++;
+        }
+
+        const int32_t rc = llama_decode(ctx_dft, batch_ingest);
+        if (rc != 0) {
+            SPC_ERR("dspark ingest decode failed rc=%d (pos=%d)\n", (int) rc, (int) batch_in.pos[0]);
+            return false;
+        }
+
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        auto * ctx_dft = params.ctx_dft;
+        const llama_model * mdl_dft = llama_get_model(ctx_dft);
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            common_batch_clear(batch_block);
+            for (int k = 0; k < n_spec; ++k) {
+                const llama_token tok = k == 0 ? dp.id_last : noise_tok;
+                common_batch_add(batch_block, tok, dp.n_past + k, { seq_id }, true);
+            }
+
+            // the whole block is bidirectional; the drafter context is separate from the
+            // target so toggling causality here affects nothing else
+            llama_set_causal_attn(ctx_dft, false);
+            const int32_t rc = llama_decode(ctx_dft, batch_block);
+            llama_set_causal_attn(ctx_dft, true);
+
+            if (rc != 0) {
+                SPC_ERR("dspark block decode failed rc=%d\n", (int) rc);
+                llama_memory_seq_rm(mem_dft, seq_id, dp.n_past, -1);
+                continue;
+            }
+
+            // sequential Markov-biased greedy sampling: position k predicts pos_k + 1
+            auto & result = *dp.result;
+            llama_token prev = dp.id_last;
+
+            const int n_draft = std::min((int) params.n_max, n_spec);
+            for (int k = 0; k < n_draft; ++k) {
+                const float * logits = llama_get_logits_ith(ctx_dft, k);
+                if (logits == nullptr) {
+                    break;
+                }
+                const bool has_bias = llama_model_dspark_markov_bias(mdl_dft, prev, bias.data());
+
+                llama_token best = 0;
+                float best_v = -INFINITY;
+                for (size_t v = 0; v < bias.size(); ++v) {
+                    const float x = logits[v] + (has_bias ? bias[v] : 0.0f);
+                    if (x > best_v) {
+                        best_v = x;
+                        best   = (llama_token) v;
+                    }
+                }
+                SPC_DBG(" - seq_id %d, dspark draft pos %3d: %6d '%s'\n",
+                        seq_id, k, best, common_token_to_piece(ctx_dft, best).c_str());
+                result.push_back(best);
+                prev = best;
+            }
+
+            // purge the block from the drafter's ring; only ingested context KV persists
+            llama_memory_seq_rm(mem_dft, seq_id, dp.n_past, -1);
+
+            if (dp.result->size() < (size_t) params.n_min) {
+                dp.result->clear();
+            }
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(n_accepted);
+        GGML_UNUSED(is_other);
+    }
+
+    bool need_embd() const override {
+        return false;
+    }
+
+    bool need_embd_nextn() const override {
+        return true;
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -2453,7 +2648,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                // DeepSeek-V4-Flash-0731 sidecars carry DSpark metadata and need the
+                // block-parallel driver instead of the chained-heads/single-head one
+                if (config.params.draft.ctx_dft != nullptr &&
+                        llama_model_dspark_block_size(llama_get_model(config.params.draft.ctx_dft)) > 0) {
+                    impls.push_back(std::make_unique<common_speculative_impl_draft_dspark>(config.params, n_seq));
+                } else {
+                    impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                }
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {

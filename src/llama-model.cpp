@@ -35,6 +35,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -2868,4 +2869,67 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
+}
+
+int32_t llama_model_dspark_block_size(const struct llama_model * model) {
+    return (int32_t) model->hparams.dspark_block_size;
+}
+
+llama_token llama_model_dspark_noise_token(const struct llama_model * model) {
+    return (llama_token) model->hparams.dspark_noise_token;
+}
+
+bool llama_model_dspark_markov_bias(const struct llama_model * model, llama_token prev, float * dst) {
+    const ggml_tensor * w1 = model->dspark_markov_w1;
+    const ggml_tensor * w2 = model->dspark_markov_w2;
+    if (!w1 || !w2 || !dst) {
+        return false;
+    }
+    GGML_ASSERT(w1->type == GGML_TYPE_BF16 && w2->type == GGML_TYPE_BF16 && "DSpark Markov head expects BF16");
+
+    const int64_t rank    = w1->ne[0];
+    const int64_t n_vocab = w2->ne[1];
+    GGML_ASSERT(prev >= 0 && prev < w1->ne[1] && "Markov prev token out of range");
+
+    // lazy CPU cache of w2 (bf16 -> f32), ~n_vocab*rank*4 bytes; callers are single-threaded
+    auto & cache = model->dspark_markov_w2_f32;
+    if (cache.empty()) {
+        std::vector<ggml_bf16_t> tmp((size_t) rank * n_vocab);
+        ggml_backend_tensor_get(const_cast<ggml_tensor *>(w2), tmp.data(), 0, tmp.size()*sizeof(ggml_bf16_t));
+        cache.resize(tmp.size());
+        ggml_bf16_to_fp32_row(tmp.data(), cache.data(), (int64_t) tmp.size());
+    }
+
+    // markov embedding of the previous token: one w1 row
+    std::vector<ggml_bf16_t> row_bf16(rank);
+    ggml_backend_tensor_get(const_cast<ggml_tensor *>(w1), row_bf16.data(), (size_t) prev * w1->nb[1], rank*sizeof(ggml_bf16_t));
+    std::vector<float> r(rank);
+    ggml_bf16_to_fp32_row(row_bf16.data(), r.data(), rank);
+
+    // dst[v] = dot(w2[v], r), sliced across threads
+    const int n_threads = std::min<int>(16, std::max<int>(1, (int) std::thread::hardware_concurrency()/4));
+    std::vector<std::thread> workers;
+    const int64_t chunk = (n_vocab + n_threads - 1) / n_threads;
+    for (int t = 0; t < n_threads; ++t) {
+        const int64_t v0 = t*chunk;
+        const int64_t v1 = std::min(n_vocab, v0 + chunk);
+        if (v0 >= v1) {
+            break;
+        }
+        workers.emplace_back([&, v0, v1]() {
+            for (int64_t v = v0; v < v1; ++v) {
+                const float * wrow = cache.data() + (size_t) v * rank;
+                float acc = 0.0f;
+                for (int64_t k = 0; k < rank; ++k) {
+                    acc += wrow[k]*r[k];
+                }
+                dst[v] = acc;
+            }
+        });
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+
+    return true;
 }

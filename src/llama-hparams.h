@@ -247,6 +247,13 @@ struct llama_hparams {
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
+    // DeepSeek-V4-Flash-0731 DSpark drafter (drafter GGUFs only; dspark_n_taps > 0 => DSpark mode)
+    uint32_t dspark_n_taps        = 0;  // number of trunk layers concat-tapped into main_proj (3)
+    std::array<uint32_t, 4> dspark_tap_layer_ids = {};  // trunk layer ids, ascending (40,41,42)
+    uint32_t dspark_noise_token   = 0;  // block filler token id (128799)
+    uint32_t dspark_block_size    = 0;  // trained draft block size incl. anchor (5)
+    uint32_t dspark_markov_rank   = 0;  // low-rank Markov head rank (256)
+
     // qwen3vl deepstack
     // When parsed from GGUF, this implies the first N layers consume the first
     // N deepstack embeddings. Use deepstack_mapping_arr if you need a more

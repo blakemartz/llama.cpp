@@ -221,6 +221,10 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+
+    // DSpark (DeepSeek-V4-Flash-0731) stage-0 trunk-context fusion
+    struct ggml_tensor * main_proj             = nullptr;
+    struct ggml_tensor * main_norm             = nullptr;
 };
 
 struct llama_layer {
@@ -586,6 +590,14 @@ struct llama_model {
     struct ggml_tensor * hc_head_base  = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
 
+    // DSpark drafter-owned output tail + Markov head (drafter sidecar GGUFs only)
+    struct ggml_tensor * dspark_head_norm     = nullptr;
+    struct ggml_tensor * dspark_hc_head_fn    = nullptr;
+    struct ggml_tensor * dspark_hc_head_base  = nullptr;
+    struct ggml_tensor * dspark_hc_head_scale = nullptr;
+    struct ggml_tensor * dspark_markov_w1     = nullptr;
+    struct ggml_tensor * dspark_markov_w2     = nullptr;
+
     // classifier
     struct ggml_tensor * cls       = nullptr;
     struct ggml_tensor * cls_b     = nullptr;
@@ -615,6 +627,10 @@ struct llama_model {
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
+
+    // DSpark Markov head: lazy CPU dequant cache of markov_w2 ([n_vocab, rank] row-major),
+    // filled on first llama_model_dspark_markov_bias() call (single-threaded callers only)
+    mutable std::vector<float> dspark_markov_w2_f32;
 
     std::vector<llama_layer> layers;
 
