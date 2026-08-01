@@ -91,26 +91,20 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
-    // graphs may consume only a subset of {tokens, embd, h} (e.g. the DSpark ingest
-    // graph reads h alone) — unconsumed inputs are never allocated, skip them
     if (ubatch->token) {
-        if (tokens && tokens->buffer) {
-            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
-        }
+        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
         // note: mtmd embedding input goes through here
         GGML_ASSERT(ubatch->embd);
-        if (embd && embd->buffer) {
-            GGML_ASSERT(n_embd == embd->ne[0]);
+        GGML_ASSERT(n_embd == embd->ne[0]);
 
-            ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
-        }
+        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
     }
 
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd && h && h->buffer) {
+    if (ubatch->embd) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
@@ -556,8 +550,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
-        // v_idxs can stay unallocated even when k_idxs is live (MLA graphs read K only)
-        if (self_v_idxs && self_v_idxs->buffer) {
+        if (self_v_idxs) {
             mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
         }
     }
@@ -570,8 +563,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
         mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
-        // v_idxs can stay unallocated even when k_idxs is live (MLA graphs read K only)
-        if (self_v_idxs_swa && self_v_idxs_swa->buffer) {
+        if (self_v_idxs_swa) {
             mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
         }
     }
@@ -3089,7 +3081,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     {
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
-        if (!has_v) {
+        if (has_v) {
             inp->self_v_idxs = mctx_cur->get_base()->build_input_v_idxs(ctx0, ubatch);
         }
 
@@ -3101,7 +3093,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache for non-SWA");
 
         inp->self_k_idxs_swa = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
-        if (!has_v) {
+        if (has_v) {
             inp->self_v_idxs_swa = mctx_cur->get_swa()->build_input_v_idxs(ctx0, ubatch);
         }
 
@@ -3110,12 +3102,12 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
     }
 
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
-    if (!has_v) {
+    if (has_v) {
         inp->self_v_rot = mctx_cur->get_base()->build_input_v_rot(ctx0);
     }
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
-    if (!has_v) {
+    if (has_v) {
         inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
     }
 
