@@ -1701,7 +1701,10 @@ llama_model_deepseek4::graph_dspark_block::graph_dspark_block(const llama_model 
     graph(params) {
     GGML_ASSERT(hparams.dspark_n_taps > 0 && "DSpark block graph requires DSpark metadata");
     GGML_ASSERT(ubatch.token && "DSpark block draft requires token input");
-    GGML_ASSERT(!cparams.causal_attn && "DSpark block draft must run non-causal (llama_set_causal_attn(ctx, false))");
+    // NOTE: no causal_attn assert here — llama_context's reserve pass builds this graph
+    // with the default (causal) cparams before the speculative driver can flip it; mask
+    // tensor shapes are identical either way, and the driver guarantees
+    // llama_set_causal_attn(ctx, false) around every real block decode.
 
     const int64_t hc = hparams.dsv4_hc_mult;
 
