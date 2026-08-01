@@ -1448,6 +1448,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             h_nextn = cparams.embeddings_nextn_masked ? flat_out : inpL;
         }
         cb(h_nextn, "h_nextn", -1);
+        // the tap mean/concat chain is not reachable from the logits output — expand it
+        // explicitly or the scheduler never assigns it a backend
+        ggml_build_forward_expand(gf, h_nextn);
         res->t_h_nextn = h_nextn;
     }
 
