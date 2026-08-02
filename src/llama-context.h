@@ -295,6 +295,9 @@ private:
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
+    // row width of the last token-embeddings extraction; can be narrower than
+    // hparams.n_embd_out() when the graph publishes a narrower t_embd (DSpark drafter)
+    uint32_t embd_row_width = 0;
 
     // hidden state required by the nextn layers (2-dimensional array: [n_outputs][n_embd])
     // populated only when cparams.embeddings_nextn is enabled and the model graph

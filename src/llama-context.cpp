@@ -909,7 +909,7 @@ float * llama_context::get_embeddings_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
-        const uint32_t n_embd_out = model.hparams.n_embd_out();
+        const uint32_t n_embd_out = embd_row_width > 0 ? embd_row_width : model.hparams.n_embd_out();
         return embd.data + j*n_embd_out;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid embeddings id %d, reason: %s\n", __func__, i, err.what());
@@ -1495,9 +1495,13 @@ int llama_context::encode(const llama_batch & batch_inp) {
         switch (cparams.pooling_type) {
             case LLAMA_POOLING_TYPE_NONE:
                 {
-                    // extract token embeddings
+                    // extract token embeddings. Graphs may publish a t_embd narrower than
+                    // hparams.n_embd_out() (the DSpark drafter's block graph emits its
+                    // n_embd-wide hidden while n_embd_out is the wider ingest-row width) —
+                    // extract at the tensor's real row width and remember it for the getters.
                     GGML_ASSERT(embd.data != nullptr);
-                    const uint32_t n_embd_out = hparams.n_embd_out();
+                    const uint32_t n_embd_out = std::min<uint32_t>(hparams.n_embd_out(), (uint32_t) t_embd->ne[0]);
+                    embd_row_width = n_embd_out;
 
                     GGML_ASSERT(n_tokens*n_embd_out <= (int64_t) embd.size);
                     ggml_backend_tensor_get_async(backend_embd, t_embd, embd.data, 0, n_tokens*n_embd_out*sizeof(float));
@@ -1941,9 +1945,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
             switch (cparams.pooling_type) {
                 case LLAMA_POOLING_TYPE_NONE:
                     {
-                        // extract token embeddings
+                        // extract token embeddings. See the single-ubatch path: the graph's
+                        // t_embd can be narrower than hparams.n_embd_out() (DSpark drafter) —
+                        // use the tensor's real row width and record it for the getters.
                         GGML_ASSERT(embd.data != nullptr);
-                        const uint32_t n_embd_out = hparams.n_embd_out();
+                        const uint32_t n_embd_out = std::min<uint32_t>(hparams.n_embd_out(), (uint32_t) t_embd->ne[0]);
+                        embd_row_width = n_embd_out;
                         float * embd_out = embd.data + n_outputs_prev*n_embd_out;
 
                         if (n_outputs) {

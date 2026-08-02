@@ -1979,7 +1979,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 // Input: this position's pre-norm hidden + markov_w1[prev], where prev is
                 // the token ENTERING position k (anchor for k=0) — exactly the `prev`
                 // variable before it advances to `best` below.
-                if (conf_head_min > 0.0f) {
+                // Unlike DeepSpec we always emit position 0: an empty proposal still pays
+                // the full block decode (~18 ms) here, so a zero-length truncation is
+                // strictly worse than verifying one ~75%-acceptance token.
+                if (conf_head_min > 0.0f && k > 0) {
                     const float * hk = llama_get_embeddings_ith(ctx_dft, k);
                     float clogit;
                     if (hk != nullptr &&
