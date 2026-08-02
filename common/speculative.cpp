@@ -1804,10 +1804,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             SPC_INF("%s", "DSPARK_CONF_HEAD_MIN set but sidecar has no confidence head (v1 export?) - disabled\n");
             conf_head_min = 0.0f;
         }
-        if (conf_head_available && conf_head_min > 0.0f) {
-            // the block graph publishes the pre-norm hidden as embeddings
-            llama_set_embeddings(ctx_dft, true);
-        }
+        // note: embeddings are toggled around the block decode only (draft()) — enabling
+        // them context-wide crashes the server's startup probe decode, whose graph does
+        // not publish t_embd
 
         SPC_TRC("- gate_min=%.2f, gate_probe=%d, draft_len=%d, conf_min=%.2f, conf_head_min=%.2f (%savailable, tap=%s)\n",
                 gate_min, gate_probe, draft_len, conf_min, conf_head_min,
@@ -1898,8 +1897,17 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 common_batch_add(batch_block, tok, dp.n_past + k, { seq_id }, true);
             }
 
-            // the drafter context is permanently non-causal (set once in the ctor)
+            // the drafter context is permanently non-causal (set once in the ctor).
+            // embeddings only for the block decode: its graph publishes the pre-norm
+            // hidden the confidence head reads; other drafter graphs have no t_embd.
+            const bool want_embd = conf_head_min > 0.0f;
+            if (want_embd) {
+                llama_set_embeddings(ctx_dft, true);
+            }
             const int32_t rc = llama_decode(ctx_dft, batch_block);
+            if (want_embd) {
+                llama_set_embeddings(ctx_dft, false);
+            }
 
             if (rc != 0) {
                 SPC_ERR("dspark block decode failed rc=%d\n", (int) rc);
