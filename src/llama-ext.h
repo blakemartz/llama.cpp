@@ -114,6 +114,17 @@ LLAMA_API bool llama_model_dspark_markov_bias(const struct llama_model * model, 
 LLAMA_API bool llama_model_dspark_markov_bias_topk(const struct llama_model * model, llama_token prev,
         const int32_t * idxs, int32_t n_idxs, float * dst);
 
+// DSpark trained confidence head: raw acceptance logit for one block position.
+// h = the drafter's PRE-final-norm post-hc-collapse hidden for that position (what the
+// block graph publishes as embeddings); prev = the token entering that position (anchor
+// for position 0, else the previously drafted token). sigmoid(logit) estimates the
+// position's acceptance probability (BCE-trained against sum_v min(p,q)).
+// tap_post_norm applies the drafter's final RMSNorm to h first (DeepSpec Qwen3
+// reference tap; SGLang's DSV4 tap — the one shipping with 0731 weights — is pre-norm).
+// Returns false if the sidecar has no confidence head (v1 exports).
+LLAMA_API bool llama_model_dspark_confidence(const struct llama_model * model,
+        const float * h, llama_token prev, bool tap_post_norm, float * out_logit);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

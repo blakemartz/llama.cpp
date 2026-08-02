@@ -1793,9 +1793,14 @@ llama_model_deepseek4::graph_dspark_block::graph_dspark_block(const llama_model 
     ggml_tensor * cur = build_hc_head(inpL, model.dspark_hc_head_fn, model.dspark_hc_head_scale, model.dspark_hc_head_base);
     cb(cur, "dspark_hc_head", -1);
 
+    // publish the PRE-final-norm, post-hc-collapse hidden as the embeddings output:
+    // this is the confidence head's input in SGLang's DSV4 DSpark (the implementation
+    // shipping with the 0731 weights). The DeepSpec Qwen3 reference taps post-norm
+    // instead; llama_model_dspark_confidence can apply head_norm itself for that A/B.
+    res->t_embd = cur;
+
     cur = build_norm(cur, model.dspark_head_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "dspark_head_norm", -1);
-    res->t_embd = cur;
 
     cur = ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "result_output", -1);

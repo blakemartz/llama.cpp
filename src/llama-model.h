@@ -633,6 +633,10 @@ struct llama_model {
     // DSpark Markov head: lazy CPU dequant cache of markov_w2 ([n_vocab, rank] row-major),
     // filled on first llama_model_dspark_markov_bias() call (single-threaded callers only)
     mutable std::vector<float> dspark_markov_w2_f32;
+    // ...and the confidence head row [n_embd + rank] + head_norm weights [n_embd],
+    // filled on first llama_model_dspark_confidence() call (single-threaded callers only)
+    mutable std::vector<float> dspark_conf_head_f32;
+    mutable std::vector<float> dspark_head_norm_f32;
 
     std::vector<llama_layer> layers;
 

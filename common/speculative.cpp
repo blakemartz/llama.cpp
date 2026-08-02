@@ -1722,6 +1722,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     int32_t gate_probe = 8;
     int32_t draft_len  = 0;    // max positions submitted per block (block computes all n_spec)
     float   conf_min   = 0.0f; // per-position emit-confidence cutoff (0 = disabled)
+    // trained confidence head (see ctor comment)
+    bool  conf_head_available = false;
+    float conf_head_min       = 0.0f; // sigmoid(conf logit) emit threshold (0 = disabled)
+    bool  conf_tap_post       = false;
     std::vector<float>   gate_ema;  // per-seq EMA of accepted tokens per drafted cycle
     std::vector<int32_t> gate_skip; // per-seq cycles skipped since the last probe
 
@@ -1786,7 +1790,28 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         conf_min   = getenv("DSPARK_CONF_MIN")   ? (float) atof(getenv("DSPARK_CONF_MIN"))  : 0.0f;
         gate_ema.assign(n_seq, (float) n_spec);
         gate_skip.assign(n_seq, 0);
-        SPC_TRC("- gate_min=%.2f, gate_probe=%d, draft_len=%d, conf_min=%.2f\n", gate_min, gate_probe, draft_len, conf_min);
+
+        // trained confidence head (v2 sidecars): per-position acceptance estimate.
+        // Probe with a zero hidden — false means a v1 sidecar without the head.
+        {
+            std::vector<float> z(llama_model_n_embd(mdl_dft), 0.0f);
+            float l;
+            conf_head_available = llama_model_dspark_confidence(mdl_dft, z.data(), 0, false, &l);
+        }
+        conf_head_min = getenv("DSPARK_CONF_HEAD_MIN") ? (float) atof(getenv("DSPARK_CONF_HEAD_MIN")) : 0.0f;
+        conf_tap_post = getenv("DSPARK_CONF_TAP") && strcmp(getenv("DSPARK_CONF_TAP"), "post") == 0;
+        if (conf_head_min > 0.0f && !conf_head_available) {
+            SPC_INF("%s", "DSPARK_CONF_HEAD_MIN set but sidecar has no confidence head (v1 export?) - disabled\n");
+            conf_head_min = 0.0f;
+        }
+        if (conf_head_available && conf_head_min > 0.0f) {
+            // the block graph publishes the pre-norm hidden as embeddings
+            llama_set_embeddings(ctx_dft, true);
+        }
+
+        SPC_TRC("- gate_min=%.2f, gate_probe=%d, draft_len=%d, conf_min=%.2f, conf_head_min=%.2f (%savailable, tap=%s)\n",
+                gate_min, gate_probe, draft_len, conf_min, conf_head_min,
+                conf_head_available ? "" : "un", conf_tap_post ? "post" : "pre");
 
         bias.resize(llama_vocab_n_tokens(llama_model_get_vocab(mdl_dft)));
     }
@@ -1938,6 +1963,23 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                     const float conf = expf(logits[best] - l_max) / sum;
                     if (conf < conf_min) {
                         break;
+                    }
+                }
+
+                // trained confidence head (DeepSpec emit rule): truncate the draft at the
+                // first position whose predicted acceptance falls below the threshold.
+                // Input: this position's pre-norm hidden + markov_w1[prev], where prev is
+                // the token ENTERING position k (anchor for k=0) — exactly the `prev`
+                // variable before it advances to `best` below.
+                if (conf_head_min > 0.0f) {
+                    const float * hk = llama_get_embeddings_ith(ctx_dft, k);
+                    float clogit;
+                    if (hk != nullptr &&
+                            llama_model_dspark_confidence(mdl_dft, hk, prev, conf_tap_post, &clogit)) {
+                        const float conf = 1.0f / (1.0f + expf(-clogit));
+                        if (conf < conf_head_min) {
+                            break;
+                        }
                     }
                 }
 

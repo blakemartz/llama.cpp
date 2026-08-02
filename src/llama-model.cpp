@@ -2973,3 +2973,68 @@ bool llama_model_dspark_markov_bias_topk(const struct llama_model * model, llama
 
     return true;
 }
+
+bool llama_model_dspark_confidence(const struct llama_model * model,
+        const float * h, llama_token prev, bool tap_post_norm, float * out_logit) {
+    const ggml_tensor * ch = model->dspark_conf_head;
+    const ggml_tensor * w1 = model->dspark_markov_w1;
+    if (!ch || !w1 || !h || !out_logit) {
+        return false;
+    }
+    GGML_ASSERT(ch->type == GGML_TYPE_BF16 && "DSpark confidence head expects BF16");
+
+    const int64_t rank   = w1->ne[0];
+    const int64_t n_feat = ch->ne[0];
+    const int64_t n_embd = n_feat - rank;
+    GGML_ASSERT(n_embd > 0 && "confidence head narrower than the markov rank");
+    GGML_ASSERT(prev >= 0 && prev < w1->ne[1] && "confidence prev token out of range");
+
+    auto & cw = model->dspark_conf_head_f32;
+    if (cw.empty()) {
+        std::vector<ggml_bf16_t> tmp((size_t) n_feat);
+        ggml_backend_tensor_get(const_cast<ggml_tensor *>(ch), tmp.data(), 0, tmp.size()*sizeof(ggml_bf16_t));
+        cw.resize(tmp.size());
+        ggml_bf16_to_fp32_row(tmp.data(), cw.data(), (int64_t) tmp.size());
+    }
+
+    // feature layout matches the reference concat: [hidden (n_embd) ; markov_w1[prev] (rank)]
+    float acc = 0.0f;
+
+    if (tap_post_norm) {
+        // DeepSpec Qwen3-reference tap: RMSNorm(h) * head_norm before projecting
+        const ggml_tensor * nw = model->dspark_head_norm;
+        if (!nw) {
+            return false;
+        }
+        auto & nrm = model->dspark_head_norm_f32;
+        if (nrm.empty()) {
+            GGML_ASSERT(nw->type == GGML_TYPE_F32 && (int64_t) nw->ne[0] == n_embd);
+            nrm.resize((size_t) n_embd);
+            ggml_backend_tensor_get(const_cast<ggml_tensor *>(nw), nrm.data(), 0, nrm.size()*sizeof(float));
+        }
+        double ssq = 0.0;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            ssq += (double) h[i] * h[i];
+        }
+        const float rrms = 1.0f / sqrtf((float) (ssq / n_embd) + model->hparams.f_norm_rms_eps);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            acc += (h[i] * rrms * nrm[i]) * cw[i];
+        }
+    } else {
+        // SGLang DSV4 tap (what the 0731 head ships with): raw pre-norm hidden
+        for (int64_t i = 0; i < n_embd; ++i) {
+            acc += h[i] * cw[i];
+        }
+    }
+
+    std::vector<ggml_bf16_t> row_bf16(rank);
+    ggml_backend_tensor_get(const_cast<ggml_tensor *>(w1), row_bf16.data(), (size_t) prev * w1->nb[1], rank*sizeof(ggml_bf16_t));
+    std::vector<float> r(rank);
+    ggml_bf16_to_fp32_row(row_bf16.data(), r.data(), rank);
+    for (int64_t k = 0; k < rank; ++k) {
+        acc += r[k] * cw[n_embd + k];
+    }
+
+    *out_logit = acc;
+    return true;
+}
