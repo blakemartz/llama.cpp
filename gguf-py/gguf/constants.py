@@ -1002,6 +1002,7 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HC_HEAD_SCALE    = auto()
     NEXTN_MARKOV_W1        = auto()  # root: markov head prev-token embed [vocab, rank]
     NEXTN_MARKOV_W2        = auto()  # root: markov head bias projection [vocab, rank]
+    NEXTN_CONF_HEAD        = auto()  # root: confidence head [n_embd + markov_rank, 1]
     # eagle3
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
@@ -1654,6 +1655,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HC_HEAD_SCALE:       "nextn.hc_head_scale",
     MODEL_TENSOR.NEXTN_MARKOV_W1:           "nextn.markov_w1",
     MODEL_TENSOR.NEXTN_MARKOV_W2:           "nextn.markov_w2",
+    MODEL_TENSOR.NEXTN_CONF_HEAD:           "nextn.conf_head",
     MODEL_TENSOR.FC:                        "fc",
     MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
     MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
@@ -3369,6 +3371,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HC_HEAD_SCALE,
         MODEL_TENSOR.NEXTN_MARKOV_W1,
         MODEL_TENSOR.NEXTN_MARKOV_W2,
+        MODEL_TENSOR.NEXTN_CONF_HEAD,
     ],
     MODEL_ARCH.ERNIE4_5_MOE: [
         MODEL_TENSOR.TOKEN_EMBD,

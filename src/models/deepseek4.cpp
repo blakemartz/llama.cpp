@@ -136,6 +136,9 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         dspark_hc_head_scale = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE, "weight"), {1}, 0);
         dspark_markov_w1     = create_tensor(tn(LLM_TENSOR_NEXTN_MARKOV_W1, "weight"), {hparams.dspark_markov_rank, n_vocab}, 0);
         dspark_markov_w2     = create_tensor(tn(LLM_TENSOR_NEXTN_MARKOV_W2, "weight"), {hparams.dspark_markov_rank, n_vocab}, 0);
+        // optional: v1 sidecar exports predate the confidence head
+        dspark_conf_head     = create_tensor(tn(LLM_TENSOR_NEXTN_CONF_HEAD, "weight"),
+                {n_embd + hparams.dspark_markov_rank, 1}, TENSOR_NOT_REQUIRED);
     }
 
     for (int i = 0; i < n_layer_all; ++i) {

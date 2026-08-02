@@ -589,9 +589,12 @@ class DeepseekV4Model(TextModel):
             is_last_stage = mtp_idx == cls._dsv4_nextn_layers - 1
 
             if cls._dsv4_is_dspark and suffix.startswith("confidence_head."):
-                # Not wired into inference by the reference implementation either
-                # (vLLM's dspark.py loader drops it too, unconditionally) - v1
-                # scope drops it entirely rather than exporting dead weights.
+                # v2: export the trained confidence head (only the final stage carries
+                # one; shape [1, n_embd + markov_rank]). vLLM drops it but SGLang's
+                # ragged-verify uses it - it's DSpark's per-position acceptance
+                # predictor and the principled emit-length signal.
+                if suffix == "confidence_head.proj.weight" and is_last_stage:
+                    return "nextn.conf_head.weight", gen
                 cls._skipped_mtp_tensors += 1
                 return None
 
@@ -878,6 +881,7 @@ class DeepseekV4Model(TextModel):
             "nextn.head_norm.weight": (gguf.MODEL_TENSOR.NEXTN_HEAD_NORM, ".weight"),
             "nextn.markov_w1.weight": (gguf.MODEL_TENSOR.NEXTN_MARKOV_W1, ".weight"),
             "nextn.markov_w2.weight": (gguf.MODEL_TENSOR.NEXTN_MARKOV_W2, ".weight"),
+            "nextn.conf_head.weight": (gguf.MODEL_TENSOR.NEXTN_CONF_HEAD, ".weight"),
         }
         if name in root_map:
             return root_map[name]

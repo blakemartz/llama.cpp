@@ -621,6 +621,9 @@ struct llama_model {
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;
     struct ggml_tensor * dspark_markov_w2   = nullptr;
+    // confidence head: single row [n_embd + markov_rank] -> acceptance logit (optional;
+    // older sidecar exports predate it)
+    struct ggml_tensor * dspark_conf_head   = nullptr;
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
