@@ -1314,6 +1314,16 @@ class DeepseekV41Model(DeepseekV4Model):
         new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, bid, ".weight")
         self.gguf_writer.add_tensor(new_name, out, raw_dtype=qtype)
         logger.info("engram layer %d: wrote %s as %s", bid, new_name, qtype.name)
+        # add_tensor has copied the memmap into the writer temp file (use_temp_file); drop the
+        # ~100 GiB staging file now so it does not survive into the temp->final write phase
+        # (that leftover staging is what overflowed the disk on the first --use-temp-file run).
+        del out
+        import gc as _gc; _gc.collect()
+        try:
+            _os.remove(tmp_path)
+            logger.info("engram layer %d: removed staging %s", bid, tmp_path)
+        except OSError:
+            pass
 
         consumed = [weight_name]
         if has_scale:
