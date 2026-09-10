@@ -60,6 +60,34 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     GGML_ASSERT(n_compress_ratios <= LLAMA_MAX_LAYERS);
     ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios);
 
+    // DeepSeek-V4.1 (arch deepseek4, discriminated by the presence of engram layers). Reads the
+    // extra V4.1 metadata -- engram config and the CSA2/CED layer topology. All optional/guarded so
+    // a V4-Flash-0731 checkpoint (which ships none of these) is completely unaffected.
+    {
+        std::vector<uint32_t> engram_layers;
+        if (ml.get_arr(LLM_KV_ENGRAM_LAYER_IDS, engram_layers, false) && !engram_layers.empty()) {
+            hparams.is_dsv41 = true;
+            ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
+            ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_head_size);
+            ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram);
+            for (uint32_t l : engram_layers) {
+                if (l < LLAMA_MAX_LAYERS) { hparams.is_engram_impl[l] = 1; }
+            }
+
+            std::vector<uint32_t> layers;
+            if (ml.get_arr(LLM_KV_ATTENTION_KV_SOURCE_LAYERS, layers, false)) {
+                for (uint32_t l : layers) { if (l < LLAMA_MAX_LAYERS) { hparams.is_kv_source_impl[l] = 1; } }
+            }
+            layers.clear();
+            if (ml.get_arr(LLM_KV_ATTENTION_INDEX_SOURCE_LAYERS, layers, false)) {
+                for (uint32_t l : layers) { if (l < LLAMA_MAX_LAYERS) { hparams.is_index_source_impl[l] = 1; } }
+            }
+            ml.get_key(LLM_KV_ATTENTION_CANDIDATE_SOURCE_LAYER, hparams.candidate_source_layer, false);
+            ml.get_key(LLM_KV_ATTENTION_CANDIDATE_BLOCK_SIZE,   hparams.candidate_block_size,   false);
+            ml.get_key(LLM_KV_ATTENTION_CANDIDATE_TOP_K_BLOCKS, hparams.candidate_top_k_blocks, false);
+        }
+    }
+
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
     if (hparams.expert_gating_func != LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
         throw std::runtime_error("DeepSeek-V4 loader currently expects sqrtsoftplus MoE scoring");
@@ -102,9 +130,10 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, 0);
-    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, 0);
-    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+    const int hc_head_flags = hparams.is_dsv41 ? TENSOR_NOT_REQUIRED : 0;  // V4.1 has no output_hc_*
+    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, hc_head_flags);
+    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, hc_head_flags);
+    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, hc_head_flags);
 
     for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
@@ -130,7 +159,38 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, flags);
 
         const int64_t ratio = hparams.dsv4_compress_ratios[i];
-        if (ratio != 0) {
+        if (hparams.is_dsv41) {
+            // V4.1 CSA2: compressor only on kv_source layers, indexer on index_source layers.
+            const int64_t idx_head = hparams.indexer_head_size;
+            if (i < n_layer && hparams.is_kv_source_impl[i]) {
+                layer.attn_comp_wkv  = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,  "weight", i), {n_embd, n_embd_head}, flags);
+                layer.attn_comp_norm = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_NORM, "weight", i), {n_embd_head}, flags);
+                if (ratio > 1) {  // ratio-2 encoder groups pool 2 tokens with a softmax gate
+                    layer.attn_comp_wgate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i), {n_embd, n_embd_head}, flags);
+                }
+            }
+            if (i < n_layer && hparams.is_index_source_impl[i]) {
+                layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, flags);
+                layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * idx_head}, flags);
+                if (hparams.is_kv_source_impl[i]) {  // CSA2 Full mode owns its index-K (Reindex layers reuse it)
+                    layer.indexer_attn_k = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K, "weight", i), {n_embd_head, idx_head}, flags);
+                    layer.indexer_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {idx_head}, flags);
+                }
+            }
+            if (i < n_layer && hparams.is_engram_impl[i]) {
+                const int64_t hc          = hc_mult;
+                const int64_t ehd         = hparams.engram_head_size;
+                const int64_t n_hash_cols = (int64_t)(hparams.engram_max_ngram - 1) * hparams.engram_n_head;
+                // engram table rows are per-layer and absent from metadata: read them from the tensor
+                const std::string embd_name = "blk." + std::to_string(i) + ".engram_embd.weight";
+                const auto * ew = ml.get_weight(embd_name.c_str());
+                const int64_t rows = ew ? ew->tensor->ne[1] : 0;
+                layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {ehd, rows}, flags);
+                layer.engram_wkv  = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,  "weight", i), {n_hash_cols * ehd, n_embd * (hc + 1)}, flags);
+                layer.engram_k    = create_tensor(tn(LLM_TENSOR_ENGRAM_K,    "weight", i), {n_embd, hc}, flags);
+                layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,    "weight", i), {n_embd, hc}, flags);
+            }
+        } else if (ratio != 0) {
             const int64_t coff = ratio == 4 ? 2 : 1;
 
             layer.attn_comp_wkv   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * n_embd_head}, flags);
@@ -183,6 +243,10 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek4::build_arch_graph(const llm_graph_params & params) const {
+    if (hparams.is_dsv41) {
+        throw std::runtime_error("deepseek4: DeepSeek-V4.1 graph not implemented yet "
+                                 "(loader-only scaffold; graph is M3/M4, oracle-driven)");
+    }
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }

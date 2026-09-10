@@ -294,6 +294,19 @@ struct llama_hparams {
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
+    // DeepSeek-V4.1 (arch deepseek4, discriminated by is_dsv41): CSA2 topology + Engram.
+    // Per-layer flags expanded from the kv_source/index_source/engram layer-id lists.
+    bool is_dsv41 = false;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> is_kv_source_impl    = {};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> is_index_source_impl = {};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> is_engram_impl       = {};
+    uint32_t candidate_source_layer = 0;
+    uint32_t candidate_block_size   = 0;
+    uint32_t candidate_top_k_blocks = 0;
+    uint32_t engram_n_head    = 0;
+    uint32_t engram_head_size = 0;
+    uint32_t engram_max_ngram = 0;
+
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;
 
