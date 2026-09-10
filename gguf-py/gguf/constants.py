@@ -884,6 +884,10 @@ class MODEL_TENSOR(IntEnum):
     VISEXP_DOWN          = auto()
     VISEXP_UP            = auto()
     INDEXER_K_NORM       = auto()
+    ENGRAM_EMBD            = auto()
+    ENGRAM_K               = auto()
+    ENGRAM_Q               = auto()
+    ENGRAM_WKV             = auto()
     INDEXER_PROJ         = auto()
     INDEXER_ATTN_K       = auto()
     INDEXER_ATTN_Q_B     = auto()
@@ -1637,6 +1641,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.VISEXP_DOWN:               "blk.{bid}.vis_down",
     MODEL_TENSOR.VISEXP_UP:                 "blk.{bid}.vis_up",
     MODEL_TENSOR.INDEXER_K_NORM:            "blk.{bid}.indexer.k_norm",
+    MODEL_TENSOR.ENGRAM_EMBD:               "blk.{bid}.engram_embd",
+    MODEL_TENSOR.ENGRAM_K:                  "blk.{bid}.engram_k",
+    MODEL_TENSOR.ENGRAM_Q:                  "blk.{bid}.engram_q",
+    MODEL_TENSOR.ENGRAM_WKV:                "blk.{bid}.engram_wkv",
     MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.indexer.proj",
     MODEL_TENSOR.INDEXER_ATTN_K:            "blk.{bid}.indexer.attn_k",
     MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.indexer.attn_q_b",
@@ -3855,6 +3863,12 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
     ],
     MODEL_ARCH.DEEPSEEK4: [
+        MODEL_TENSOR.ENGRAM_EMBD,
+        MODEL_TENSOR.ENGRAM_K,
+        MODEL_TENSOR.ENGRAM_Q,
+        MODEL_TENSOR.ENGRAM_WKV,
+        MODEL_TENSOR.INDEXER_K_NORM,
+        MODEL_TENSOR.INDEXER_ATTN_K,
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.OUTPUT,

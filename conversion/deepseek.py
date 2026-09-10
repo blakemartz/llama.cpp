@@ -525,6 +525,10 @@ class DeepseekV32Model(DeepseekV2Model):
 @ModelBase.register("DeepseekV4ForCausalLM")
 @ModelBase.example("deepseek-ai/DeepSeek-V4-Flash-Base")
 class DeepseekV4Model(TextModel):
+    # V4.1 reuses the deepseek4 arch label for now. This covers conversion only: the current
+    # deepseek4 runtime requires output_hc_fn, output_hc_base and output_hc_scale, which V4.1
+    # does not ship, so a converted file will not load until a V4.1 graph exists. Whoever adds
+    # that runtime should decide whether V4.1 gets its own arch, and this label follows.
     model_arch = gguf.MODEL_ARCH.DEEPSEEK4
     supports_mtp_export = True
     _skipped_mtp_tensors = 0
@@ -1102,3 +1106,228 @@ class DeepseekV4FlashVisionModel(MmprojModel):
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("DeepseekV41ForCausalLM")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash")
+class DeepseekV41Model(DeepseekV4Model):
+    """DeepSeek V4.1. Subclasses V4 and overrides only where the checkpoint differs.
+
+    Differences from V4 that this class has to account for:
+
+      * the text parameters are nested under text_config
+      * num_hash_layers is absent, while the V4 path reads it unconditionally
+      * the FP8 scale block size is [32, 32] rather than V4's [128, 128]
+      * the engram tables, the indexer k_norm and wk projections are new tensors
+      * attn.compressor.ape and attn.indexer.compressor.* are absent
+
+    The block size matters most. Reusing V4's hardcoded value silently rescales every
+    dequantized weight, which produces a model that loads and generates fluent text while
+    being numerically wrong.
+    """
+
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+
+    def _v41_flatten_hparams(self):
+        """Promote the nested text_config to the top level.
+
+        V4.1 nests its text parameters under text_config while the inherited V4 code expects
+        them flat. Overriding load_hparams does not work, because base.__init__ calls
+        ModelBase.load_hparams explicitly rather than through the instance, so the seam is the
+        first consumer of hparams instead, which is index_tensors.
+        """
+        for key, value in (self.hparams.get("text_config") or {}).items():
+            self.hparams.setdefault(key, value)
+        # absent in V4.1; V4 reads it unconditionally
+        self.hparams.setdefault("num_hash_layers", 0)
+
+    def index_tensors(self, remote_hf_model_id=None):
+        self._v41_flatten_hparams()
+        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        # the FP8 scale block size, read rather than assumed
+        qcfg = raw.get("quantization_config") or {}
+        block = qcfg.get("weight_block_size") or [128, 128]
+        self._v41_block_rows = int(block[0])
+        self._v41_block_cols = int(block[1] if len(block) > 1 else block[0])
+        logger.info(
+            "DeepSeek V4.1: fp8 weight_block_size %dx%d, engram layers %s",
+            self._v41_block_rows, self._v41_block_cols,
+            self.hparams.get("engram_layer_ids"),
+        )
+
+        self.block_count = self.hparams["num_hidden_layers"]
+        if self.mtp_only:
+            self.block_count += self.hparams.get("num_nextn_predict_layers", 0)
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, _ = item
+        # the vision tower and its aligner are exported separately as an mmproj file
+        if name.startswith(("vision.", "aligner.", "image_")):
+            return None
+        return super().filter_tensors(item)
+
+    def dequant_model(self):
+        """Same as V4 but with the block size taken from the checkpoint."""
+        fp8_dtypes = self._float8_dtypes()
+        tensors_to_remove: list[str] = []
+        rows, cols = self._v41_block_rows, self._v41_block_cols
+
+        def dequant_fp8_weight(weight: Tensor, scale: Tensor) -> Tensor:
+            out_features, in_features = weight.shape
+            scale_f = self._e8m0_to_float(scale)
+            scale_f = scale_f.repeat_interleave(rows, 0)[:out_features]
+            scale_f = scale_f.repeat_interleave(cols, 1)[:, :in_features]
+            return weight.float() * scale_f
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".scale"):
+                continue
+            weight_name = name.removesuffix(".scale") + ".weight"
+            if weight_name not in self.model_tensors:
+                continue
+            weight = self.model_tensors[weight_name]
+            scale = self.model_tensors[name]
+            if weight().dtype not in fp8_dtypes:
+                continue
+            self.model_tensors[weight_name] = lambda w=weight, s=scale: dequant_fp8_weight(w(), s())
+            self._dsv4_fp8_dequantized.add(weight_name)
+            tensors_to_remove.append(name)
+
+        for name in tensors_to_remove:
+            del self.model_tensors[name]
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+        if (engram_ids := hparams.get("engram_layer_ids")) is not None:
+            self.gguf_writer.add_uint32("deepseek4.engram.head_count", hparams["engram_n_heads"])
+            self.gguf_writer.add_uint32("deepseek4.engram.key_length", hparams["engram_head_dim"])
+            self.gguf_writer.add_uint32("deepseek4.engram.max_ngram_size", hparams["engram_max_ngram_size"])
+            self.gguf_writer.add_array("deepseek4.engram.layer_ids", engram_ids)
+
+
+    # rows per block when rewriting an engram table; 1M rows is about 1 GB of float32 scratch
+    _V41_ENGRAM_CHUNK_ROWS = 1_000_000
+
+    def _write_engram_table(self, bid: int) -> list[str]:
+        """Quantize one engram table in row blocks, accumulating into a disk-backed memmap.
+
+        The inherited FP8 path cannot be used here. It computes weight.float() * scale over the
+        whole tensor, and one engram table is 384,006,168 x 256, so 98.3 billion elements, which
+        is roughly 393 GB as float32, which exhausts host memory on any machine likely to be
+        running the conversion. Every other tensor in the model converts through the normal path.
+
+        The scale layout also differs from the rest of the checkpoint. Linear weights carry a
+        [rows/32, cols/32] scale matching weight_block_size [32, 32], while the engram scale is
+        [rows, 8], which is one scale per 32 columns within a single row. Broadcasting it the way
+        the generic path does would corrupt the table, so it is expanded along columns only.
+
+        Reading is done straight from the safetensors shard rather than through the lazy tensor
+        wrapper, because to_eager materializes the whole tensor before any slicing takes effect.
+        """
+        import json as _json
+        import os as _os
+        import tempfile as _tempfile
+
+        import numpy as _np
+        from safetensors import safe_open as _safe_open
+
+        weight_name = f"layers.{bid}.engram.embed.weight"
+        scale_name = f"layers.{bid}.engram.embed.scale"
+
+        index_path = self.dir_model / "model.safetensors.index.json"
+        with open(index_path, "r", encoding="utf-8") as f:
+            weight_map = _json.load(f)["weight_map"]
+        shard = self.dir_model / weight_map[weight_name]
+
+        qtype = gguf.GGMLQuantizationType.Q8_0
+        block_elems = gguf.GGML_QUANT_SIZES[qtype][0]
+
+        with _safe_open(str(shard), framework="pt") as f:
+            wsl = f.get_slice(weight_name)
+            n_rows, n_cols = (int(x) for x in wsl.get_shape())
+            has_scale = scale_name in f.keys()
+            ssl = f.get_slice(scale_name) if has_scale else None
+            scale_groups = int(ssl.get_shape()[1]) if has_scale else 0
+
+            if n_cols % block_elems:
+                raise ValueError(
+                    f"engram row width {n_cols} is not a multiple of the {qtype.name} block {block_elems}"
+                )
+            if has_scale and n_cols % scale_groups:
+                raise ValueError(
+                    f"engram row width {n_cols} is not divisible by its {scale_groups} scale groups"
+                )
+            per_group = n_cols // scale_groups if has_scale else 0
+
+            row_bytes = int(gguf.quantize(_np.zeros((1, n_cols), dtype=_np.float32), qtype).nbytes)
+            rows_per_chunk = min(int(self._V41_ENGRAM_CHUNK_ROWS), n_rows)
+            n_chunks = (n_rows + rows_per_chunk - 1) // rows_per_chunk
+
+            tmp_dir = _os.environ.get("V41_ENGRAM_TMPDIR") or _tempfile.gettempdir()
+            tmp_path = _os.path.join(tmp_dir, f"engram_{bid}_{qtype.name}.bin")
+            logger.info(
+                "engram layer %d: %d x %d, scale groups %d, %s in %d blocks of %d rows, staging %.1f GB at %s",
+                bid, n_rows, n_cols, scale_groups, qtype.name, n_chunks, rows_per_chunk,
+                n_rows * row_bytes / 1e9, tmp_path,
+            )
+
+            out = _np.memmap(tmp_path, dtype=_np.uint8, mode="w+", shape=(n_rows, row_bytes))
+            for ci, start in enumerate(range(0, n_rows, rows_per_chunk)):
+                stop = min(start + rows_per_chunk, n_rows)
+                chunk = wsl[start:stop, :].float()
+                if has_scale:
+                    s = self._e8m0_to_float(ssl[start:stop, :])
+                    chunk = chunk * s.repeat_interleave(per_group, 1)[:, :n_cols]
+                out[start:stop] = gguf.quantize(
+                    chunk.cpu().numpy().astype(_np.float32), qtype
+                ).reshape(stop - start, row_bytes)
+                del chunk
+                if ci % 25 == 0:
+                    logger.info("  engram layer %d: %d / %d rows", bid, stop, n_rows)
+            out.flush()
+
+        new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, bid, ".weight")
+        self.gguf_writer.add_tensor(new_name, out, raw_dtype=qtype)
+        logger.info("engram layer %d: wrote %s as %s", bid, new_name, qtype.name)
+
+        consumed = [weight_name]
+        if has_scale:
+            consumed.append(scale_name)
+        return consumed
+
+    def generate_extra_tensors(self):
+        yield from super().generate_extra_tensors()
+
+        consumed: list[str] = []
+        for bid in (self.hparams.get("engram_layer_ids") or []):
+            if f"layers.{bid}.engram.embed.weight" in self.model_tensors:
+                consumed.extend(self._write_engram_table(int(bid)))
+        for name in consumed:
+            if name in self.model_tensors:
+                del self.model_tensors[name]
+
+    def _map_dsv4_tensor_name(self, name: str, bid):
+        match = re.match(r"layers\.(\d+)\.(.+)$", name)
+        if match is not None:
+            v41_only = {
+                "engram.embed.weight": (gguf.MODEL_TENSOR.ENGRAM_EMBD, ".weight"),
+                "engram.k_weight": (gguf.MODEL_TENSOR.ENGRAM_K, ".weight"),
+                "engram.q_weight": (gguf.MODEL_TENSOR.ENGRAM_Q, ".weight"),
+                "engram.wkv.weight": (gguf.MODEL_TENSOR.ENGRAM_WKV, ".weight"),
+                "attn.indexer.k_norm.weight": (gguf.MODEL_TENSOR.INDEXER_K_NORM, ".weight"),
+                "attn.indexer.wk.weight": (gguf.MODEL_TENSOR.INDEXER_ATTN_K, ".weight"),
+            }
+            tensor_name = match.group(2)
+            if tensor_name in v41_only:
+                return v41_only[tensor_name]
+        return super()._map_dsv4_tensor_name(name, bid)
