@@ -1214,6 +1214,21 @@ class DeepseekV41Model(DeepseekV4Model):
             self.gguf_writer.add_uint32("deepseek4.engram.max_ngram_size", hparams["engram_max_ngram_size"])
             self.gguf_writer.add_array("deepseek4.engram.layer_ids", engram_ids)
 
+        # V4.1 layer topology: CSA2 mode assignment (Full/Reindex/Reuse) and CED grouping depend on
+        # these explicit lists and cannot be derived from compress_ratios (the source layers are a
+        # subset of the ratio-1/2 range). The reference reads them from config; emit them so the
+        # runtime graph can too. Guarded so 0731 (which lacks them) is unaffected.
+        if (kv_src := hparams.get("kv_source_layer_ids")) is not None:
+            self.gguf_writer.add_array("deepseek4.attention.kv_source_layers", kv_src)
+        if (idx_src := hparams.get("index_source_layer_ids")) is not None:
+            self.gguf_writer.add_array("deepseek4.attention.index_source_layers", idx_src)
+        if (cand := hparams.get("candidate_source_layer_id")) is not None:
+            self.gguf_writer.add_uint32("deepseek4.attention.candidate_source_layer", cand)
+        if (cbs := hparams.get("candidate_block_size")) is not None:
+            self.gguf_writer.add_uint32("deepseek4.attention.candidate_block_size", cbs)
+        if (ctb := hparams.get("candidate_topk_blocks")) is not None:
+            self.gguf_writer.add_uint32("deepseek4.attention.candidate_top_k_blocks", ctb)
+
 
     # rows per block when rewriting an engram table; 1M rows is about 1 GB of float32 scratch
     _V41_ENGRAM_CHUNK_ROWS = 1_000_000
