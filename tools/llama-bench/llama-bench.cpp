@@ -939,6 +939,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         if (buft) {
                             buft_list[ggml_backend_buft_name(buft)] = buft;
                         }
+                        // extra buffer types as well (CPU_REPACK, or an RPC device's remote one)
+                        auto * reg = ggml_backend_dev_backend_reg(dev);
+                        auto get_extra_bufts_fn = reg ? (ggml_backend_dev_get_extra_bufts_t)
+                            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+                        if (get_extra_bufts_fn) {
+                            auto ** extra = get_extra_bufts_fn(dev);
+                            while (extra && *extra) {
+                                buft_list[ggml_backend_buft_name(*extra)] = *extra;
+                                ++extra;
+                            }
+                        }
                     }
                 }
                 auto override_group_span_len = std::strcspn(value, ",");
