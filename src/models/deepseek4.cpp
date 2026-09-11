@@ -1653,7 +1653,10 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_engram(
     ggml_tensor * key = ggml_view_3d(ctx0, kv, n_embd, hc, nt, n_embd*es, kv->nb[1], 0);   // [n_embd, hc, nt]
     ggml_tensor * val = ggml_view_2d(ctx0, kv, n_embd, nt, kv->nb[1], hc*n_embd*es);       // [n_embd, nt]
 
-    ggml_tensor * w = ggml_mul(ctx0, layer.engram_q, layer.engram_k);              // [n_embd, hc], only ever used as a product
+    // q/k ship as BF16; the CPU backend has no F32 x BF16 mul, and the reference forms the product in f32
+    ggml_tensor * w = ggml_mul(ctx0,
+            ggml_cast(ctx0, layer.engram_q, GGML_TYPE_F32),
+            ggml_cast(ctx0, layer.engram_k, GGML_TYPE_F32));                            // [n_embd, hc] f32
     const float eps = hparams.f_norm_rms_eps;
 
     ggml_tensor * out = nullptr;
