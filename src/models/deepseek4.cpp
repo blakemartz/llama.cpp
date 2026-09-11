@@ -191,7 +191,7 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
                 const std::string embd_name = "blk." + std::to_string(i) + ".engram_embd.weight";
                 const auto * ew = ml.get_weight(embd_name.c_str());
                 const int64_t rows = ew ? ew->tensor->ne[1] : 0;
-                layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {ehd, rows}, flags);
+                layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {ehd, rows}, flags | TENSOR_READ_LAZY);   // 104 GB tables: rows on demand from the mmap
                 layer.engram_wkv  = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,  "weight", i), {n_hash_cols * ehd, n_embd * (hc + 1)}, flags);
                 layer.engram_k    = create_tensor(tn(LLM_TENSOR_ENGRAM_K,    "weight", i), {n_embd, hc}, flags);
                 layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,    "weight", i), {n_embd, hc}, flags);
