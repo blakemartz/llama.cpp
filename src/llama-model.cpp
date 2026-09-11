@@ -14,6 +14,7 @@
 #include "llama-kv-cache-dsa-iswa.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-dsv41.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
@@ -2440,11 +2441,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
                 if (hparams.is_dsv41) {
-                    // DeepSeek-V4.1 first pass: sliding-window attention on every layer through the
-                    // standard iSWA cache (the 0731 dsv4 cache is ratio-4/128 machinery V4.1 lacks).
-                    // The CSA2/CED compressed caches come later; no MTP context yet.
+                    // DeepSeek-V4.1: sliding-window cache on every layer + the CED compressed cache on
+                    // the kv_source layers (see llama_kv_cache_dsv41). No MTP context yet.
                     GGML_ASSERT(params.ctx_type != LLAMA_CONTEXT_TYPE_MTP && "DeepSeek-V4.1 MTP not implemented yet");
-                    res = new llama_kv_cache_iswa(
+                    res = new llama_kv_cache_dsv41(
                             *this,
                             params.type_k,
                             params.type_v,
@@ -2455,11 +2455,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
                             cparams.n_ubatch,
-                            1,
-                            nullptr,
-                            nullptr,
-                            nullptr,
-                            nullptr);
+                            1);
                 } else if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                     const llama_memory_i::layer_filter_cb filter_mtp = [&](int32_t il) {
                         return il >= (int32_t) hparams.n_layer();

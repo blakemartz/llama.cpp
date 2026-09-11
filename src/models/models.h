@@ -1178,7 +1178,7 @@ struct llama_model_dots3note : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
-class llm_graph_input_dsv41_csa;
+class llm_graph_input_dsv41;
 
 struct llama_model_deepseek4 : public llama_model_base {
     llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
@@ -1327,9 +1327,11 @@ struct llama_model_deepseek4 : public llama_model_base {
     struct graph_v41 : public graph {
         graph_v41(const llama_model & model, const llm_graph_params & params);
 
+        llm_graph_input_dsv41 * build_inp_dsv41() const;
+
         ggml_tensor * build_attention_v41(
                 const llama_model & model,
-                llm_graph_input_attn_k_iswa * inp_attn,
+                llm_graph_input_dsv41 * inp,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 int il) const;
@@ -1342,14 +1344,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * x,
                 int il) const;
 
-        // CSA2 / CED state for the current graph (prefill-only first pass):
-        //   csa_entry: compress ratio -> index into inp_csa->entries (visibility mask + group positions)
-        //   ced_src[il]: the kv_source layer whose compressed K layer il attends (nearest at or before il)
-        //   ced_k[il]:   the compressed K produced at kv_source layer il, [n_embd_head, 1, n_comp]
-        llm_graph_input_dsv41_csa * inp_csa = nullptr;
-        std::map<int64_t, int> csa_entry;
+        // CED: ced_src[il] = the kv_source layer whose compressed K layer il attends (nearest at or before il)
         std::vector<int> ced_src;
-        mutable std::vector<ggml_tensor *> ced_k;
     };
 
     struct graph_mtp : public graph {
