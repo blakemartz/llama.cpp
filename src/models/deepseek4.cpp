@@ -244,8 +244,8 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek4::build_arch_graph(const llm_graph_params & params) const {
     if (hparams.is_dsv41) {
-        throw std::runtime_error("deepseek4: DeepSeek-V4.1 graph not implemented yet "
-                                 "(loader-only scaffold; graph is M3/M4, oracle-driven)");
+        GGML_ASSERT(params.gtype != LLM_GRAPH_TYPE_DECODER_MTP && "DeepSeek-V4.1 DSpark MTP not implemented yet");
+        return std::make_unique<graph_v41>(*this, params);
     }
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
@@ -415,11 +415,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
     return comb;
 }
 
-ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
+void llama_model_deepseek4::graph::build_hc_mixes(
         ggml_tensor * x,
         ggml_tensor * hc_fn,
         ggml_tensor * hc_scale,
         ggml_tensor * hc_base,
+        ggml_tensor ** pre,
         ggml_tensor ** post,
         ggml_tensor ** comb,
         int il) const {
@@ -442,11 +443,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     ggml_tensor * base_pre  = dsv4_view_1d(ctx0, hc_base, hc, 0);
     ggml_tensor * base_post = dsv4_view_1d(ctx0, hc_base, hc, hc);
 
-    ggml_tensor * pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
-    pre = dsv4_hc_affine(ctx0, pre, scale_pre, base_pre);
-    pre = ggml_sigmoid(ctx0, pre);
-    pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
-    cb(pre, "hc_pre", il);
+    *pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
+    *pre = dsv4_hc_affine(ctx0, *pre, scale_pre, base_pre);
+    *pre = ggml_sigmoid(ctx0, *pre);
+    *pre = ggml_scale_bias(ctx0, *pre, 1.0f, hparams.dsv4_hc_eps);
+    cb(*pre, "hc_pre", il);
 
     *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
     *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
@@ -468,9 +469,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         *comb = build_hc_sinkhorn(*comb, il);
     }
     cb(*comb, "hc_comb", il);
+}
 
-    ggml_tensor * result = build_hc_pre(x, pre, il);
-    return result;
+ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
+        ggml_tensor * x,
+        ggml_tensor * hc_fn,
+        ggml_tensor * hc_scale,
+        ggml_tensor * hc_base,
+        ggml_tensor ** post,
+        ggml_tensor ** comb,
+        int il) const {
+    ggml_tensor * pre = nullptr;
+    build_hc_mixes(x, hc_fn, hc_scale, hc_base, &pre, post, comb, il);
+    return build_hc_pre(x, pre, il);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
@@ -1562,5 +1573,223 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
+    ggml_build_forward_expand(gf, cur);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// DeepSeek-V4.1 graph (first pass)
+// ---------------------------------------------------------------------------------------------
+
+ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
+        const llama_model & model,
+        llm_graph_input_attn_k_iswa * inp_attn,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        int il) const {
+    const auto & layer = model.layers[il];
+
+    const int64_t n_embd_head      = hparams.n_embd_head_k();
+    const int64_t n_embd_head_rope = hparams.n_rot();
+    const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
+    const int64_t n_groups         = hparams.dsv4_o_group_count;
+    const int64_t n_heads_group    = n_head / n_groups;
+    const int64_t o_lora_rank      = hparams.dsv4_o_lora_rank;
+    const int64_t o_group_dim      = n_heads_group*n_embd_head;
+    const int64_t nt               = cur->ne[1];
+
+    GGML_ASSERT(n_embd_head == n_embd_head_v);
+    GGML_ASSERT(n_head % n_groups == 0);
+
+    // compress layers rope with the compress base + YaRN; pure window layers use the base theta, no YaRN
+    const bool use_compress_rope = hparams.dsv4_compress_ratios[il] != 0;
+    const float freq_base_l      = use_compress_rope ? hparams.dsv4_compress_rope_base : freq_base;
+    const float freq_scale_l     = use_compress_rope ? freq_scale : 1.0f;
+    const float ext_factor_l     = use_compress_rope ? ext_factor : 0.0f;
+    const float attn_factor_l    = dsv4_rope_attn_factor(freq_scale_l, ext_factor_l);
+    const float beta_fast_l      = use_compress_rope ? beta_fast : 0.0f;
+    const float beta_slow_l      = use_compress_rope ? beta_slow : 0.0f;
+    const int32_t n_ctx_orig_l   = use_compress_rope ? n_ctx_orig : 0;
+
+    ggml_tensor * qr = build_lora_mm(layer.wq_a, cur);
+    cb(qr, "qr", il);
+
+    qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+    cb(qr, "qr_norm", il);
+
+    // V4.1: no per-head RMS norm on q (0731's graph applies one here); rope on the tail dims only
+    ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
+    q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
+    q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+    q = ggml_rope_set_offset(q, n_embd_head_nope);
+    cb(q, "q", il);
+
+    ggml_tensor * kv = build_lora_mm(layer.wkv, cur);
+    kv = build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt);
+    cb(kv, "kv_norm", il);
+
+    kv = ggml_rope_ext(ctx0, kv, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+    kv = ggml_rope_set_offset(kv, n_embd_head_nope);
+    cb(kv, "kv", il);
+
+    // First pass: sliding-window attention with sinks, K = V = the single shared kv head.
+    // Exact for the ratio-0 layers; the CSA2/CED compressed positions (ratio 1/2) are TODO --
+    // they join this softmax by concatenating K and the top-k mask (see build_csa_lid_attention).
+    ggml_tensor * out = build_attn(inp_attn,
+            nullptr, nullptr, nullptr,
+            q, kv, kv,
+            nullptr, layer.attn_sinks, nullptr,
+            1.0f/sqrtf(float(n_embd_head)), il);
+    cb(out, "attn_window", il);
+
+    out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
+    out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+    out = ggml_rope_set_offset(out, n_embd_head_nope);
+    cb(out, "attn_derope", il);
+
+    // block-diagonal wo_a over the head groups, then wo_b
+    out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
+    out = ggml_permute(ctx0, out, 0, 2, 1, 3);
+    ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+    cb(oa, "attn_wo_a", il);
+    oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
+    oa = ggml_cont_2d(ctx0, oa, o_lora_rank*n_groups, nt);
+
+    out = build_lora_mm(layer.wo_b, oa);
+    cb(out, "attn_out", il);
+
+    return out;
+}
+
+llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm_graph_params & params) :
+    graph(params) {
+    GGML_ASSERT(hparams.is_dsv41);
+    ggml_tensor * cur;
+
+    ggml_tensor * inp = build_inp_embd(model.tok_embd);
+    ggml_tensor * inp_pos = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
+
+    const int64_t hc = hparams.dsv4_hc_mult;
+    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+    cb(inpL, "hc_init", -1);
+
+    // Single-Pass mHC: each sublayer applies the pre-mix the PREVIOUS sublayer produced. The chain
+    // starts with the one-hot mix selecting stream 0 (the reference make_identity_pre_mix).
+    ggml_tensor * ones  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_tokens), 1.0f);
+    ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f);
+    ggml_tensor * pre_mix = ggml_concat(ctx0, ones, zeros, 0); // [hc, n_tokens]
+    cb(pre_mix, "hc_pre_mix_init", -1);
+
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = model.layers[il];
+
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
+        // TODO(engram): layers with hparams.is_engram_impl[il] add the n-gram memory here, before attention
+
+        ggml_tensor * residual = inpL;
+        ggml_tensor * attn_pre = nullptr, * attn_post = nullptr, * attn_comb = nullptr;
+        build_hc_mixes(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base,
+                &attn_pre, &attn_post, &attn_comb, il);
+
+        cur = build_hc_pre(inpL, pre_mix, il);          // the previous sublayer's mix
+        cb(cur, "hc_attn_pre", il);
+
+        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "attn_norm", il);
+
+        cur = build_attention_v41(model, inp_attn, cur, inp_pos, il);
+
+        inpL = build_hc_post(cur, residual, attn_post, attn_comb, il);
+        cb(inpL, "hc_attn_post", il);
+
+        residual = inpL;
+        ggml_tensor * ffn_pre = nullptr, * ffn_post = nullptr, * ffn_comb = nullptr;
+        build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base,
+                &ffn_pre, &ffn_post, &ffn_comb, il);
+
+        ggml_build_forward_expand(gf, residual);
+        ggml_build_forward_expand(gf, ffn_post);
+        ggml_build_forward_expand(gf, ffn_comb);
+
+        cur = build_hc_pre(inpL, attn_pre, il);         // this layer's attention mix feeds its FFN
+        cb(cur, "hc_ffn_pre", il);
+
+        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "ffn_norm", il);
+
+        ggml_tensor * moe_out = build_moe_ffn(cur,
+                layer.ffn_gate_inp,
+                layer.ffn_up_exps,
+                layer.ffn_gate_exps,
+                layer.ffn_down_exps,
+                layer.ffn_exp_probs_b,
+                n_expert, hparams.n_expert_used(),
+                LLM_FFN_SILU, hparams.expert_weights_norm,
+                hparams.expert_weights_scale,
+                (llama_expert_gating_func_type) hparams.expert_gating_func,
+                il);
+        cb(moe_out, "ffn_moe_out", il);
+
+        ggml_tensor * ffn_shexp = build_ffn(cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp", il);
+
+        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        cb(cur, "ffn_out", il);
+
+        inpL = build_hc_post(cur, residual, ffn_post, ffn_comb, il);
+        inpL = build_cvec(inpL, il);
+        cb(inpL, "l_last", il);
+
+        pre_mix = ffn_pre;                              // threaded to the next layer's attention
+    }
+
+    if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
+        res->t_layer_inp[n_layer] = dsv4_hc_mean(ctx0, inpL);
+        cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
+        ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
+    }
+
+    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+    ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
+
+    if (cparams.embeddings_nextn) {
+        ggml_tensor * h_nextn = cparams.embeddings_nextn_masked ? flat_out : inpL;
+        cb(h_nextn, "h_nextn", -1);
+        res->t_h_nextn = h_nextn;
+    }
+
+    if (inp_out_ids) {
+        pre_mix = ggml_get_rows(ctx0, pre_mix, inp_out_ids);
+        inpL = ggml_reshape_3d(ctx0, flat_out, n_embd, hc, n_outputs);
+    }
+
+    // V4.1 output collapse: the threaded pre-mix (the last FFN's), no output_hc_* head
+    cur = build_hc_pre(inpL, pre_mix, -1);
+    cb(cur, "hc_out", -1);
+
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
     ggml_build_forward_expand(gf, cur);
 }

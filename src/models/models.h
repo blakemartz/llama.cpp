@@ -1196,6 +1196,18 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor ** comb,
                 int il) const;
 
+        // mHC coefficients only, no collapse. V4.1 (Single-Pass mHC) applies the PREVIOUS
+        // sublayer's pre-mix, so it needs `pre` back as a tensor instead of applied.
+        void build_hc_mixes(
+                ggml_tensor * x,
+                ggml_tensor * hc_fn,
+                ggml_tensor * hc_scale,
+                ggml_tensor * hc_base,
+                ggml_tensor ** pre,
+                ggml_tensor ** post,
+                ggml_tensor ** comb,
+                int il) const;
+
         ggml_tensor * build_hc_post(
                 ggml_tensor * x,
                 ggml_tensor * residual,
@@ -1303,6 +1315,21 @@ struct llama_model_deepseek4 : public llama_model_base {
 
         ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
+                int il) const;
+    };
+
+    // DeepSeek-V4.1 (arch deepseek4, hparams.is_dsv41): Single-Pass mHC, no output_hc head,
+    // Engram, CSA2/CED. First pass: sliding-window attention with sinks on every layer through
+    // the iSWA cache (exact for the ratio-0 layers); compressed attention and Engram are added
+    // incrementally against the CPU oracle.
+    struct graph_v41 : public graph {
+        graph_v41(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_attention_v41(
+                const llama_model & model,
+                llm_graph_input_attn_k_iswa * inp_attn,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
                 int il) const;
     };
 

@@ -2439,7 +2439,28 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             {
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                if (hparams.is_dsv41) {
+                    // DeepSeek-V4.1 first pass: sliding-window attention on every layer through the
+                    // standard iSWA cache (the 0731 dsv4 cache is ratio-4/128 machinery V4.1 lacks).
+                    // The CSA2/CED compressed caches come later; no MTP context yet.
+                    GGML_ASSERT(params.ctx_type != LLAMA_CONTEXT_TYPE_MTP && "DeepSeek-V4.1 MTP not implemented yet");
+                    res = new llama_kv_cache_iswa(
+                            *this,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            params.swa_full,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            cparams.n_ubatch,
+                            1,
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            nullptr);
+                } else if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                     const llama_memory_i::layer_filter_cb filter_mtp = [&](int32_t il) {
                         return il >= (int32_t) hparams.n_layer();
                     };
