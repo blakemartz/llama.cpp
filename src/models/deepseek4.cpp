@@ -1726,6 +1726,20 @@ public:
         }
     }
 
+    // The engram graph topology depends only on the (constant) layer list and hash width: the hashes
+    // themselves are re-uploaded by set_input on every ubatch. Allowing reuse here is what lets decode
+    // skip the rebuild -- and, cross-node, lets the RPC backend send GRAPH_RECOMPUTE instead of
+    // re-serializing the whole remote subgraph for every token.
+    bool can_reuse(const llm_graph_params & params) override {
+        const int64_t n_tokens = params.ubatch.n_tokens;
+        bool res = true;
+        for (const auto * t : hashes) {
+            res &= t->ne[0] == n_hash_cols;
+            res &= t->ne[1] == n_tokens;
+        }
+        return res;
+    }
+
     std::vector<int32_t> layer_ids;                 // engram layers in order (index = layer_hash_index)
     int64_t n_hash_cols;
     std::vector<ggml_tensor *> hashes;              // I32 [n_hash_cols, n_tokens] per engram layer

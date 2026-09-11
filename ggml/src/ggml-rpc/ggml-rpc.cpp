@@ -77,6 +77,7 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
+    RPC_CMD_SET_N_THREADS,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -204,6 +205,11 @@ struct rpc_msg_graph_recompute_req {
     uint32_t device;
 };
 
+struct rpc_msg_set_n_threads_req {
+    uint32_t device;
+    uint32_t n_threads;
+};
+
 #pragma pack(pop)
 
 // RPC data structures
@@ -234,6 +240,7 @@ struct ggml_backend_rpc_context {
     std::shared_ptr<rpc_dispatcher> dispatcher;
     uint32_t                        device;
     std::string                     name;
+    int                             n_threads = 0;   // last value pushed to the server (0 = never)
 };
 
 struct ggml_backend_rpc_buffer_context {
@@ -1033,6 +1040,22 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     return GGML_STATUS_SUCCESS;
 }
 
+// Forward the caller's thread count to the remote CPU backend. llama.cpp calls this before every
+// graph with n_threads (decode) or n_threads_batch (prefill); without it the server is stuck with the
+// single -t it was started with, which is a bad trade: batch-1 decode wants few threads (thread-barrier
+// overhead dominates the tiny per-op work) while prefill wants all of them.
+static void ggml_backend_rpc_set_n_threads(ggml_backend_t backend, int n_threads) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    if (n_threads < 1 || n_threads == rpc_ctx->n_threads) {
+        return;
+    }
+    rpc_ctx->n_threads = n_threads;
+    auto request = std::make_shared<rpc_msg_set_n_threads_req>();
+    request->device    = rpc_ctx->device;
+    request->n_threads = (uint32_t) n_threads;
+    rpc_ctx->dispatcher->send_async(RPC_CMD_SET_N_THREADS, request, sizeof(*request));
+}
+
 static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_ctx->dispatcher->event_record(event);
@@ -1149,6 +1172,7 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    bool set_n_threads(const rpc_msg_set_n_threads_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
@@ -1767,6 +1791,26 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     return true;
 }
 
+bool rpc_server::set_n_threads(const rpc_msg_set_n_threads_req & request) {
+    uint32_t device = request.device;
+    if (device >= backends.size()) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[device]);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return true;   // nothing to do, not an error
+    }
+    auto set_n_threads_fn = (ggml_backend_set_n_threads_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (set_n_threads_fn == nullptr) {
+        return true;   // e.g. a CUDA device: no thread count to set
+    }
+    LOG_DBG("[%s] device: %u, n_threads: %u\n", __func__, device, request.n_threads);
+    set_n_threads_fn(backends[device], (int) request.n_threads);
+    return true;
+}
+
 bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response) {
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
@@ -2033,6 +2077,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SET_N_THREADS: {
+                rpc_msg_set_n_threads_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.set_n_threads(request)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_DEVICE_MEMORY: {
                 rpc_msg_get_device_memory_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -2268,6 +2322,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_set_n_threads") == 0) {
+        return (void *)ggml_backend_rpc_set_n_threads;
     }
     return NULL;
 
