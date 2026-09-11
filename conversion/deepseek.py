@@ -988,8 +988,8 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             return None
         return super().filter_tensors((cls._rekey_mtp_tensor_name(name), gen))
 
-    @staticmethod
-    def _rekey_mtp_tensor_name(name: str) -> str:
+    @classmethod
+    def _rekey_mtp_tensor_name(cls, name: str) -> str:
         match = re.match(r"mtp\.(\d+)\.(.+)$", name)
         if match is None:
             raise ValueError(f"Unexpected DSpark tensor {name!r}")
@@ -1002,7 +1002,7 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             "hc_head_base",
             "hc_head_scale",
         )
-        if rest in DeepseekV4DSparkModel._DSPARK_ROOT_MAP or rest in root_names:
+        if rest in cls._DSPARK_ROOT_MAP or rest in root_names:
             return rest
         return f"layers.{stage}.{rest}"
 
@@ -1356,3 +1356,58 @@ class DeepseekV41Model(DeepseekV4Model):
             if tensor_name in v41_only:
                 return v41_only[tensor_name]
         return super()._map_dsv4_tensor_name(name, bid)
+
+
+@ModelBase.register("DeepseekV41DSparkModel")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash")
+class DeepseekV41DSparkModel(DeepseekV4DSparkModel, DeepseekV41Model):
+    """The DSpark draft stages of DeepSeek-V4.1, exported as a DFLASH sidecar.
+
+    V4.1 keeps its three draft stages under `mtp.*` inside the main checkpoint rather than in a
+    separate repo, so this converts the same directory a second time with --dspark. Structurally a
+    stage is a V4.1 layer with a smaller expert pool (128 routed, 3 active) and no compressor or
+    indexer, plus the DSpark heads on the ends: `main_proj`/`main_norm` on stage 0, which fuse the
+    target's last three layers into the draft's attention KV, and `norm`/`markov_head`/
+    `confidence_head` on stage 2.
+
+    Differences from the V4 DSpark export, all of them checkpoint-level:
+      * the markov head is stored as `embed`/`head` rather than `markov_w1`/`markov_w2`
+      * there is no output hyper-connection head - V4.1 folds the copies with the mix the last
+        layer already computed, so `hc_head_*` is simply absent
+      * the expert counts come from the `dspark_*` hparams, because the draft pool is a quarter of
+        the target's and emitting the target's would misdescribe the file
+      * fp8 scale blocks are 32x32, inherited from DeepseekV41Model
+    """
+
+    # declared here as well as inherited: ModelBase.__init_subclass__ wants it in the class body
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    _DSPARK_ROOT_MAP: dict[str, tuple[gguf.MODEL_TENSOR, str]] = {
+        "main_proj.weight":            (gguf.MODEL_TENSOR.FC, ".weight"),
+        "main_norm.weight":            (gguf.MODEL_TENSOR.ENC_OUTPUT_NORM, ".weight"),
+        "markov_head.embed.weight":    (gguf.MODEL_TENSOR.DSPARK_MARKOV_W1, ".weight"),
+        "markov_head.head.weight":     (gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, ".weight"),
+        "confidence_head.proj.weight": (gguf.MODEL_TENSOR.DSPARK_CONF_PROJ, ".weight"),
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._v41_flatten_hparams()
+
+        # the draft pool is its own size; inheriting the target's would describe the file wrongly
+        self.hparams["n_routed_experts"]    = self.hparams["dspark_n_routed_experts"]
+        self.hparams["num_experts_per_tok"] = self.hparams["dspark_num_experts_per_tok"]
+
+        # target-only machinery: a draft stage has no engram, no compressor and no indexer, so
+        # none of those keys should end up in a dflash file
+        for key in ("engram_layer_ids", "kv_source_layer_ids", "index_source_layer_ids",
+                    "candidate_source_layer_id", "candidate_block_size", "candidate_topk_blocks"):
+            self.hparams.pop(key, None)
+        # note: the inherited V4 path reads index_n_heads unconditionally, so a dflash file carries
+        # an indexer head count it never uses. Inert, and the V4 DSpark export does the same.
+
+    def set_vocab(self):
+        # unlike V4, the draft ships inside the target checkpoint, so the tokenizer is already here
+        if self.target_model_dir is None:
+            self.target_model_dir = self.dir_model
+        super().set_vocab()
