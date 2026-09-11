@@ -4737,13 +4737,30 @@ static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_
 
 static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                        const void * data, size_t offset, size_t size) {
+    auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
+    if (tensor_traits == nullptr) {
+        // nothing to repack for this tensor's type/shape: store it as-is. supports_op() returns false
+        // for it, so it is served by the ordinary kernels, which expect exactly this layout.
+        memcpy((char *) tensor->data + offset, data, size);
+        GGML_UNUSED(buffer);
+        return;
+    }
+
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
-    auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
-    auto OK            = tensor_traits->repack(tensor, data, size);
+    auto OK = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_cpu_repack_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
+                                                      void * data, size_t offset, size_t size) {
+    // only meaningful for tensors that were not repacked (a repacked tensor no longer holds the
+    // original layout, so reading it back would be a lie)
+    GGML_ASSERT(tensor->extra == nullptr && "cannot read back a repacked tensor");
+    memcpy(data, (const char *) tensor->data + offset, size);
     GGML_UNUSED(buffer);
 }
 
@@ -4763,7 +4780,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
     buffer->buft              = buft;
     buffer->iface.init_tensor = ggml_backend_cpu_repack_buffer_init_tensor;
     buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
-    buffer->iface.get_tensor  = nullptr;
+    buffer->iface.get_tensor  = ggml_backend_cpu_repack_buffer_get_tensor;
     buffer->iface.cpy_tensor  = nullptr;
     return buffer;
 }

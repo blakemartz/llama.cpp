@@ -119,6 +119,7 @@ struct rpc_msg_init_tensor_req {
 
 struct rpc_msg_alloc_buffer_req {
     uint32_t device;
+    uint32_t buft_kind;   // 0 = the device's default buffer type, n = its n-th extra buffer type
     uint64_t size;
 };
 
@@ -230,6 +231,7 @@ struct ggml_backend_rpc_device_context {
 struct ggml_backend_rpc_buffer_type_context {
     std::string endpoint;
     uint32_t    device;
+    uint32_t    buft_kind;
     std::string name;
     size_t      alignment;
     size_t      max_size;
@@ -790,6 +792,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     auto request = std::make_shared<rpc_msg_alloc_buffer_req>();
     request->device = buft_ctx->device;
+    request->buft_kind = buft_ctx->buft_kind;
     request->size = size;
     rpc_msg_alloc_buffer_rsp response;
 
@@ -1086,10 +1089,14 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .graph_optimize          = */ NULL,
 };
 
-ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
+// buft_kind 0 is the remote device's default buffer type; kind n>0 is its n-th extra buffer type
+// (on a CPU device that is the repack buffer type, which stores quantized weights in the layout the
+// SIMD kernels want). Extra buffer types are opt-in per tensor through -ot, because only the remote
+// side knows which tensors its repack kernels can actually handle.
+static ggml_backend_buffer_type_t rpc_buffer_type(const char * endpoint, uint32_t device, uint32_t buft_kind) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    std::string buft_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
+    std::string buft_name = "RPC" + std::to_string(device) + (buft_kind ? "_REPACK" : "") + "[" + std::string(endpoint) + "]";
     // NOTE: buffer types are allocated and never freed; this is by design
     static std::unordered_map<std::string, ggml_backend_buffer_type_t> buft_map;
     auto it = buft_map.find(buft_name);
@@ -1102,6 +1109,7 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
         /* .endpoint  = */ endpoint,
         /* .device    = */ device,
+        /* .buft_kind = */ buft_kind,
         /* .name      = */ buft_name,
         /* .alignment = */ alignment,
         /* .max_size  = */ max_size
@@ -1114,6 +1122,10 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     };
     buft_map[buft_name] = buft;
     return buft;
+}
+
+ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
+    return rpc_buffer_type(endpoint, device, 0);
 }
 
 ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
@@ -1194,6 +1206,7 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    std::unordered_set<ggml_backend_buffer_t> extra_buffers;   // allocated from an extra buffer type
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
 };
@@ -1251,15 +1264,31 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
         return false;
     }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+    if (request.buft_kind > 0) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto get_extra_bufts_fn = reg ? (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+        ggml_backend_buffer_type_t * extra = get_extra_bufts_fn ? get_extra_bufts_fn(dev) : nullptr;
+        for (uint32_t i = 0; extra && extra[i]; i++) {
+            if (i + 1 == request.buft_kind) {
+                buft = extra[i];
+                break;
+            }
+        }
+    }
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
     response.remote_ptr = 0;
     response.remote_size = 0;
     if (buffer != nullptr) {
         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
         response.remote_size = buffer->size;
-        LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
-            __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
+        LOG_DBG("[%s] device: %d, buft: %s, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
+            __func__, dev_id, ggml_backend_buft_name(buft), request.size, response.remote_ptr, response.remote_size);
         buffers.insert(buffer);
+        if (request.buft_kind > 0 && buft != ggml_backend_get_default_buffer_type(backends[dev_id])) {
+            extra_buffers.insert(buffer);
+        }
     } else {
         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
     }
@@ -1303,6 +1332,7 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 }
 
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+    extra_buffers.erase(reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr));
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
@@ -1417,6 +1447,15 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     result->flags = tensor->flags;
     result->data = reinterpret_cast<void *>(tensor->data);
     ggml_set_name(result, tensor->name);
+
+    // Tensors living in an extra-buffer-type buffer (the CPU repack buft) carry backend state in
+    // ->extra, but the server rebuilds every tensor from the wire, so that state has to be restored
+    // here. init_tensor for those buffers is a pure function of the tensor's type and shape, so
+    // re-running it is safe and cheap; buffers from the default buffer type are left alone, since
+    // their init_tensor (CUDA's, for one) has side effects on the data.
+    if (result->buffer && extra_buffers.count(result->buffer) && result->buffer->iface.init_tensor) {
+        result->buffer->iface.init_tensor(result->buffer, result);
+    }
     return result;
 }
 
@@ -1560,7 +1599,7 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
         }
     }
 
-    if (tensor->extra != nullptr) {
+    if (tensor->extra != nullptr && !extra_buffers.count(tensor->buffer)) {
         // This pointer can either be passed around client/server, or probably better stored server-side and kept track of.
         // Currently unimplemented.
         GGML_LOG_ERROR("tensor->extra populated by the backend, this is currently unsupported.\n");
@@ -2237,6 +2276,23 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
     GGML_UNUSED(dev);
 }
 
+// One extra buffer type per device, mirroring whatever extra buffer type the remote device has.
+// llama.cpp appends these after the device default in its buffer-type list, so nothing is selected
+// automatically -- they are reachable through -ot, e.g.
+//   -ot 'blk\.(1[4-9]|[23][0-9])\.ffn_(gate|up|down)_exps=RPC2_REPACK[192.168.1.91:50052]'
+static ggml_backend_buffer_type_t * ggml_backend_rpc_device_get_extra_bufts(ggml_backend_dev_t dev) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    static std::unordered_map<ggml_backend_dev_t, std::array<ggml_backend_buffer_type_t, 2>> bufts;
+    auto it = bufts.find(dev);
+    if (it == bufts.end()) {
+        ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+        it = bufts.emplace(dev, std::array<ggml_backend_buffer_type_t, 2>{
+                rpc_buffer_type(ctx->endpoint.c_str(), ctx->device, 1), nullptr }).first;
+    }
+    return it->second.data();
+}
+
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     GGML_UNUSED(op);
@@ -2250,7 +2306,7 @@ static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_b
     }
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
-    return buft_ctx->endpoint == dev_ctx->endpoint && buft_ctx->device == dev_ctx->device;
+    return buft_ctx->endpoint == dev_ctx->endpoint && buft_ctx->device == dev_ctx->device;   // any kind
 }
 
 static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
@@ -2325,6 +2381,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_set_n_threads") == 0) {
         return (void *)ggml_backend_rpc_set_n_threads;
+    }
+    if (std::strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *)ggml_backend_rpc_device_get_extra_bufts;
     }
     return NULL;
 
