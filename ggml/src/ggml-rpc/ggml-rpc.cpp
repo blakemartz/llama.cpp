@@ -1453,7 +1453,13 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     // here. init_tensor for those buffers is a pure function of the tensor's type and shape, so
     // re-running it is safe and cheap; buffers from the default buffer type are left alone, since
     // their init_tensor (CUDA's, for one) has side effects on the data.
-    if (result->buffer && extra_buffers.count(result->buffer) && result->buffer->iface.init_tensor) {
+    //
+    // Only for the stored tensor itself: a *view* of it has a different shape, and handing the view
+    // repack traits picked for that shape sends it to the wrong kernel (a 3-D view of a 2-D repacked
+    // weight lands in forward_mul_mat, which asserts on the rank). A view must fall back to whatever
+    // the graph would do without the extra buffer type.
+    if (result->buffer && extra_buffers.count(result->buffer) && result->buffer->iface.init_tensor &&
+        tensor->op == GGML_OP_NONE && tensor->view_src == 0) {
         result->buffer->iface.init_tensor(result->buffer, result);
     }
     return result;
