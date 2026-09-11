@@ -1411,3 +1411,14 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel, DeepseekV41Model):
         if self.target_model_dir is None:
             self.target_model_dir = self.dir_model
         super().set_vocab()
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        # The V4 export writes dspark_target_layer_ids + 1. The runtime uses the value directly as an
+        # index into the target's per-layer hidden states, where entry i is the *input* of layer i,
+        # and V4.1's reference is explicit that "the MTP head reads the attention input of its target
+        # layers, not their output" (inference/model.py, Transformer.forward). So for V4.1 the ids go
+        # in unshifted: +1 would feed the draft the layer after the one it was trained on, which
+        # drafts fluently and wrongly.
+        self.gguf_writer.add_target_layers(list(self.hparams["dspark_target_layer_ids"]))
