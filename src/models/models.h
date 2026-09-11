@@ -1331,6 +1331,14 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 int il) const;
+
+        // Engram: n-gram hash memory added into the hc residual stream (layers 1 and 14).
+        // hashes: I32 [n_hash_cols, n_tokens] row ids into the layer's Q8_0 table.
+        ggml_tensor * build_engram(
+                const llama_model & model,
+                ggml_tensor * hashes,
+                ggml_tensor * x,
+                int il) const;
     };
 
     struct graph_mtp : public graph {

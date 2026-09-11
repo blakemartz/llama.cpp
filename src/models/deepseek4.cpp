@@ -4,6 +4,8 @@
 #include "llama-kv-cache-dsv4.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -1581,6 +1583,102 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 // DeepSeek-V4.1 graph (first pass)
 // ---------------------------------------------------------------------------------------------
 
+// Engram hash ids per engram layer: I32 [n_hash_cols, n_tokens]. For the M4 diff they come precomputed
+// from the reference hasher via DSV41_ENGRAM_HASHES=<raw i32 laid out [n_engram_layers][n_pos][n_hash_cols]>;
+// the in-runtime hasher (compressed token map + xor/mod hash, the multipliers/primes precomputed into
+// the GGUF) is TODO.
+class llm_graph_input_dsv41_engram : public llm_graph_input_i {
+public:
+    llm_graph_input_dsv41_engram(std::vector<int32_t> layer_ids, int64_t n_hash_cols) :
+        layer_ids(std::move(layer_ids)), n_hash_cols(n_hash_cols) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const char * path = getenv("DSV41_ENGRAM_HASHES");
+        GGML_ASSERT(path && "DSV41_ENGRAM_HASHES=<raw i32 [n_engram_layers][n_pos][n_hash_cols]> is required (in-runtime hasher TODO)");
+        if (table.empty()) {
+            FILE * f = std::fopen(path, "rb");
+            GGML_ASSERT(f && "cannot open DSV41_ENGRAM_HASHES");
+            std::fseek(f, 0, SEEK_END);
+            const size_t n = (size_t) std::ftell(f) / sizeof(int32_t);
+            std::fseek(f, 0, SEEK_SET);
+            table.resize(n);
+            const size_t got = std::fread(table.data(), sizeof(int32_t), n, f);
+            std::fclose(f);
+            GGML_ASSERT(got == n);
+            n_pos_file = n / (layer_ids.size() * (size_t) n_hash_cols);
+        }
+        const int64_t n_tokens = ubatch->n_tokens;
+        std::vector<int32_t> buf((size_t) n_hash_cols * n_tokens);
+        for (size_t li = 0; li < layer_ids.size(); ++li) {
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                const size_t pos = (size_t) ubatch->pos[t];
+                GGML_ASSERT(pos < n_pos_file && "DSV41_ENGRAM_HASHES has no row for this position");
+                for (int64_t c = 0; c < n_hash_cols; ++c) {
+                    buf[(size_t) t*n_hash_cols + c] = table[(li*n_pos_file + pos)*(size_t) n_hash_cols + (size_t) c];
+                }
+            }
+            ggml_backend_tensor_set(hashes[li], buf.data(), 0, buf.size()*sizeof(int32_t));
+        }
+    }
+
+    std::vector<int32_t> layer_ids;                 // engram layers in order (index = layer_hash_index)
+    int64_t n_hash_cols;
+    std::vector<ggml_tensor *> hashes;              // I32 [n_hash_cols, n_tokens] per engram layer
+    std::vector<int32_t> table;
+    size_t n_pos_file = 0;
+};
+
+ggml_tensor * llama_model_deepseek4::graph_v41::build_engram(
+        const llama_model & model,
+        ggml_tensor * hashes,
+        ggml_tensor * x,
+        int il) const {
+    const auto & layer = model.layers[il];
+    GGML_ASSERT(layer.engram_embd && layer.engram_wkv && layer.engram_q && layer.engram_k);
+
+    const int64_t hc   = hparams.dsv4_hc_mult;
+    const int64_t nt   = x->ne[2];
+    const int64_t ehd  = hparams.engram_head_size;      // 256
+    const int64_t ncol = hashes->ne[0];                 // (max_ngram_size-1)*n_heads = 24
+    GGML_ASSERT(x->ne[0] == n_embd && x->ne[1] == hc && hashes->ne[1] == nt);
+
+    // gather the n-gram rows, then one wkv projection over their concatenation -> key per copy + value
+    ggml_tensor * ids  = ggml_reshape_1d(ctx0, hashes, ncol*nt);
+    ggml_tensor * rows = ggml_get_rows(ctx0, layer.engram_embd, ids);           // [ehd, ncol*nt]
+    rows = ggml_reshape_2d(ctx0, rows, ncol*ehd, nt);                           // [ncol*ehd, nt]
+    ggml_tensor * kv = ggml_mul_mat(ctx0, layer.engram_wkv, rows);              // [n_embd*(hc+1), nt]
+    cb(kv, "engram_kv", il);
+
+    const size_t es = ggml_element_size(kv);
+    ggml_tensor * key = ggml_view_3d(ctx0, kv, n_embd, hc, nt, n_embd*es, kv->nb[1], 0);   // [n_embd, hc, nt]
+    ggml_tensor * val = ggml_view_2d(ctx0, kv, n_embd, nt, kv->nb[1], hc*n_embd*es);       // [n_embd, nt]
+
+    ggml_tensor * w = ggml_mul(ctx0, layer.engram_q, layer.engram_k);              // [n_embd, hc], only ever used as a product
+    const float eps = hparams.f_norm_rms_eps;
+
+    ggml_tensor * out = nullptr;
+    for (int64_t s = 0; s < hc; ++s) {
+        ggml_tensor * xs = ggml_view_2d(ctx0, x,   n_embd, nt, x->nb[2],   s*x->nb[1]);
+        ggml_tensor * ks = ggml_view_2d(ctx0, key, n_embd, nt, key->nb[2], s*key->nb[1]);
+        ggml_tensor * ws = ggml_view_1d(ctx0, w,   n_embd, s*w->nb[1]);
+
+        // gate = sigmoid(signed_sqrt(<rms_norm(x), w * rms_norm(key)> / sqrt(dim))), per (token, copy)
+        ggml_tensor * xn  = ggml_rms_norm(ctx0, ggml_cont(ctx0, xs), eps);
+        ggml_tensor * kn  = ggml_rms_norm(ctx0, ggml_cont(ctx0, ks), eps);
+        ggml_tensor * dot = ggml_mul(ctx0, ggml_mul(ctx0, xn, ws), kn);
+        dot = ggml_sum_rows(ctx0, dot);                                           // [1, nt]
+        dot = ggml_scale(ctx0, dot, 1.0f/sqrtf((float) n_embd));
+        ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY));
+        ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, dot), mag)); // [1, nt]
+
+        ggml_tensor * ys = ggml_add(ctx0, xs, ggml_mul(ctx0, val, gate));        // x + gate * value
+        ys = ggml_reshape_3d(ctx0, ggml_cont(ctx0, ys), n_embd, 1, nt);
+        out = out ? ggml_concat(ctx0, out, ys, 1) : ys;
+    }
+    cb(out, "engram_out", il);
+    return out;
+}
+
 ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
         const llama_model & model,
         llm_graph_input_attn_k_iswa * inp_attn,
@@ -1687,6 +1785,23 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
     ggml_tensor * pre_mix = ggml_concat(ctx0, ones, zeros, 0); // [hc, n_tokens]
     cb(pre_mix, "hc_pre_mix_init", -1);
 
+    // Engram hash-id inputs, one per engram layer
+    llm_graph_input_dsv41_engram * inp_engram = nullptr;
+    std::vector<int32_t> engram_layers;
+    for (int il = 0; il < n_layer; ++il) {
+        if (hparams.is_engram_impl[il]) { engram_layers.push_back(il); }
+    }
+    if (!engram_layers.empty()) {
+        const int64_t n_hash_cols = (int64_t) (hparams.engram_max_ngram - 1) * hparams.engram_n_head;
+        auto inp = std::make_unique<llm_graph_input_dsv41_engram>(engram_layers, n_hash_cols);
+        for (size_t li = 0; li < engram_layers.size(); ++li) {
+            ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_hash_cols, n_tokens);
+            ggml_set_input(t);
+            inp->hashes.push_back(t);
+        }
+        inp_engram = (llm_graph_input_dsv41_engram *) res->add_input(std::move(inp));
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
@@ -1696,7 +1811,10 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
 
-        // TODO(engram): layers with hparams.is_engram_impl[il] add the n-gram memory here, before attention
+        if (hparams.is_engram_impl[il]) {
+            const size_t li = std::find(engram_layers.begin(), engram_layers.end(), il) - engram_layers.begin();
+            inpL = build_engram(model, inp_engram->hashes[li], inpL, il);
+        }
 
         ggml_tensor * residual = inpL;
         ggml_tensor * attn_pre = nullptr, * attn_post = nullptr, * attn_comb = nullptr;
