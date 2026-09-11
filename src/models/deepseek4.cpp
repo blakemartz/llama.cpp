@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <vector>
 #include <cmath>
@@ -1589,14 +1590,115 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 // from the reference hasher via DSV41_ENGRAM_HASHES=<raw i32 laid out [n_engram_layers][n_pos][n_hash_cols]>;
 // the in-runtime hasher (compressed token map + xor/mod hash, the multipliers/primes precomputed into
 // the GGUF) is TODO.
+// Engram hasher constants (the reference NgramHashState buffers), exported by
+// oracle/check_engram_consts.py into DSV41_ENGRAM_CONSTS=<dir>: token_map.i32 [n_vocab] (token -> compressed
+// id), multipliers.i64 [n_layers][max_ngram], primes.i64 [n_layers][max_ngram-1][n_heads],
+// offsets.i64 [n_layers][(max_ngram-1)*n_heads], meta.txt. TODO: carry these in the GGUF instead.
+struct dsv41_engram_consts {
+    bool loaded = false;
+    int32_t n_layers = 0, max_ngram = 0, n_heads = 0, pad_id = 0;
+    std::vector<int32_t> token_map;
+    std::vector<int64_t> multipliers, primes, offsets;
+
+    static const dsv41_engram_consts & get() {
+        static dsv41_engram_consts c;
+        if (c.loaded) { return c; }
+        const char * dir = getenv("DSV41_ENGRAM_CONSTS");
+        if (!dir) { return c; }
+        auto read_vec = [&](const char * name, auto & vec) {
+            std::string path = std::string(dir) + "/" + name;
+            FILE * f = std::fopen(path.c_str(), "rb");
+            GGML_ASSERT(f && "engram consts: missing file");
+            std::fseek(f, 0, SEEK_END); const size_t n = (size_t) std::ftell(f) / sizeof(vec[0]); std::fseek(f, 0, SEEK_SET);
+            vec.resize(n);
+            const size_t got = std::fread(vec.data(), sizeof(vec[0]), n, f);
+            std::fclose(f);
+            GGML_ASSERT(got == n);
+        };
+        read_vec("token_map.i32",   c.token_map);
+        read_vec("multipliers.i64", c.multipliers);
+        read_vec("primes.i64",      c.primes);
+        read_vec("offsets.i64",     c.offsets);
+        {
+            std::string path = std::string(dir) + "/meta.txt";
+            FILE * f = std::fopen(path.c_str(), "r");
+            GGML_ASSERT(f && "engram consts: missing meta.txt");
+            char key[64]; long long val;
+            while (std::fscanf(f, "%63s %lld", key, &val) == 2) {
+                if      (!strcmp(key, "n_layers"))  c.n_layers  = (int32_t) val;
+                else if (!strcmp(key, "max_ngram")) c.max_ngram = (int32_t) val;
+                else if (!strcmp(key, "n_heads"))   c.n_heads   = (int32_t) val;
+                else if (!strcmp(key, "pad_id"))    c.pad_id    = (int32_t) val;
+                else { int ch; while ((ch = std::fgetc(f)) != EOF && ch != '\n') {} }   // skip the rest of the line (layer_ids ...)
+            }
+            std::fclose(f);
+        }
+        GGML_ASSERT(c.n_layers > 0 && c.max_ngram > 1 && c.n_heads > 0);
+        GGML_ASSERT((int64_t) c.multipliers.size() == (int64_t) c.n_layers * c.max_ngram);
+        GGML_ASSERT((int64_t) c.primes.size()      == (int64_t) c.n_layers * (c.max_ngram - 1) * c.n_heads);
+        GGML_ASSERT((int64_t) c.offsets.size()     == (int64_t) c.n_layers * (c.max_ngram - 1) * c.n_heads);
+        c.loaded = true;
+        return c;
+    }
+};
+
 class llm_graph_input_dsv41_engram : public llm_graph_input_i {
 public:
     llm_graph_input_dsv41_engram(std::vector<int32_t> layer_ids, int64_t n_hash_cols) :
         layer_ids(std::move(layer_ids)), n_hash_cols(n_hash_cols) {}
 
+    // In-runtime hasher: the reference NgramHashState. Each position is hashed with the compressed ids
+    // of itself and the max_ngram-1 tokens before it (pad before the sequence start); the running XOR of
+    // id*multiplier after step i is the (i+1)-gram hash, each landing in its own prime-sized bucket range.
+    // The per-sequence compressed-id history persists across ubatches (decode) in a process-wide table,
+    // reset when a sequence restarts at position 0. TODO: move the history into the context state.
+    void set_input_hashed(const llama_ubatch * ubatch) {
+        const auto & c = dsv41_engram_consts::get();
+        GGML_ASSERT(c.loaded && "set DSV41_ENGRAM_CONSTS=<dir> (or DSV41_ENGRAM_HASHES for a precomputed table)");
+        GGML_ASSERT(ubatch->token && "engram hasher needs token ids");
+        static std::map<int32_t, std::vector<int32_t>> hist;   // seq_id -> compressed id per position
+        const int64_t n_tokens = ubatch->n_tokens;
+        const int32_t G = c.max_ngram, H = c.n_heads;
+        GGML_ASSERT((int64_t) (G - 1) * H == n_hash_cols);
+        std::vector<std::vector<int32_t>> buf(layer_ids.size(), std::vector<int32_t>((size_t) n_hash_cols * n_tokens));
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            const int32_t seq = ubatch->seq_id[t][0];
+            const int64_t pos = ubatch->pos[t];
+            auto & h = hist[seq];
+            if (pos == 0) { h.clear(); }
+            if ((int64_t) h.size() <= pos) { h.resize(pos + 1, c.pad_id); }
+            const llama_token tok = ubatch->token[t];
+            GGML_ASSERT(tok >= 0 && (size_t) tok < c.token_map.size());
+            h[pos] = c.token_map[tok];
+            std::vector<int64_t> toks(G);
+            for (int32_t sh = 0; sh < G; ++sh) {
+                const int64_t p = pos - sh;
+                toks[sh] = (p < 0) ? c.pad_id : h[p];
+            }
+            for (size_t li = 0; li < layer_ids.size(); ++li) {
+                const int64_t * mult = &c.multipliers[li * G];
+                int64_t rolling = toks[0] * mult[0];
+                for (int32_t i = 1; i < G; ++i) {
+                    rolling ^= toks[i] * mult[i];
+                    for (int32_t hh = 0; hh < H; ++hh) {
+                        const int64_t prime  = c.primes [(li * (G - 1) + (i - 1)) * H + hh];
+                        const int64_t offset = c.offsets[ li * (G - 1) * H + (i - 1) * H + hh];
+                        buf[li][(size_t) t * n_hash_cols + (i - 1) * H + hh] = (int32_t) (rolling % prime + offset);
+                    }
+                }
+            }
+        }
+        for (size_t li = 0; li < layer_ids.size(); ++li) {
+            ggml_backend_tensor_set(hashes[li], buf[li].data(), 0, buf[li].size() * sizeof(int32_t));
+        }
+    }
+
     void set_input(const llama_ubatch * ubatch) override {
         const char * path = getenv("DSV41_ENGRAM_HASHES");
-        GGML_ASSERT(path && "DSV41_ENGRAM_HASHES=<raw i32 [n_engram_layers][n_pos][n_hash_cols]> is required (in-runtime hasher TODO)");
+        if (!path) {
+            set_input_hashed(ubatch);
+            return;
+        }
         if (table.empty()) {
             FILE * f = std::fopen(path, "rb");
             GGML_ASSERT(f && "cannot open DSV41_ENGRAM_HASHES");
@@ -1910,8 +2012,12 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
     {
         ggml_tensor * mask_win = inp_attn->get_kq_mask_swa();
         GGML_ASSERT(mask_win && "V4.1 needs the iSWA window mask");
+        // first pass = prefill from position 0 only: the compressed groups are indexed from the start of
+        // the ubatch. Any other ubatch (decode, continuation) falls back to window-only attention until
+        // the compressed-KV cache exists (TODO); Engram still applies through its token history.
+        const bool prefill_from_zero = ubatch.n_tokens > 0 && ubatch.pos != nullptr && ubatch.pos[0] == 0;
         auto inp = std::make_unique<llm_graph_input_dsv41_csa>();
-        for (int il = 0; il < n_layer; ++il) {
+        for (int il = 0; il < n_layer && prefill_from_zero; ++il) {
             const int64_t ratio = hparams.dsv4_compress_ratios[il];
             if (ratio == 0 || csa_entry.count(ratio) != 0) { continue; }
             const int64_t n_comp = n_tokens / ratio;
