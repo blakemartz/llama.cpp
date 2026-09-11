@@ -471,6 +471,11 @@ struct llama_mmap::impl {
         int fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
+        // A model far larger than RAM (the 508 GB DeepSeek-V4.1 GGUF on a 121 GiB box): populating /
+        // WILLNEED-ing the whole file only churns the page cache and starves the ~10% a forward touches,
+        // while --numa's whole-file POSIX_MADV_RANDOM kills readahead (4 KiB faults). Plain demand paging
+        // with the kernel's default readahead is the right middle -- opt in with LLAMA_MMAP_NO_PREFETCH=1.
+        if (getenv("LLAMA_MMAP_NO_PREFETCH")) { prefetch = 0; }
 #ifdef __linux__
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
