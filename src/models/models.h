@@ -1344,8 +1344,24 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * x,
                 int il) const;
 
+        // CSA2 indexer: score this layer's queries against the indexer keys its CED source published
+        // and keep the best hparams.indexer_top_k compressed positions. Only an index_source layer
+        // runs this; the layers after it reuse the selection (see csa2_top_k).
+        ggml_tensor * build_indexer_top_k_v41(
+                const llama_model & model,
+                llm_graph_input_dsv41 * inp,
+                ggml_tensor * qr,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int il) const;
+
         // CED: ced_src[il] = the kv_source layer whose compressed K layer il attends (nearest at or before il)
         std::vector<int> ced_src;
+
+        // the most recent index_source layer's compressed-position selection, reused by the layers
+        // after it. mutable because the layer loop runs from the (non-const) constructor through
+        // build_attention_v41, which is const.
+        mutable ggml_tensor * csa2_top_k = nullptr;
     };
 
     struct graph_mtp : public graph {

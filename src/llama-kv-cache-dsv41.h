@@ -11,7 +11,12 @@
 //   plain causal mask plus an odd-position filter yields the reference visibility rule; an unpaired
 //   even token parks its raw wkv / wgate projections in its own cell's K / V until its partner
 //   arrives -- the pending half-group survives across ubatches with no extra state.
-// The two layer sets overlap, which llama_kv_cache_iswa cannot express, hence this composition.
+// Plus an indexer-key cache over the CSA2-Full layers (index_source AND kv_source): each publishes one
+// indexer key (indexer_head_size wide, K only) per compressed cell, so the CSA2 indexer can score
+// this layer's queries against them and keep only indexer_top_k compressed positions. It shares the
+// compressed cache's cell layout exactly -- same kv_size, same k_idxs -- so cell i means the same
+// compressed position in both, for either ratio.
+// The layer sets overlap, which llama_kv_cache_iswa cannot express, hence this composition.
 class llama_kv_cache_dsv41 : public llama_memory_i {
 public:
     llama_kv_cache_dsv41(
@@ -53,12 +58,18 @@ public:
 
     llama_kv_cache * get_win () const;
     llama_kv_cache * get_comp() const;
+    llama_kv_cache * get_idx () const;
 
 private:
     const bool unified;
 
+    // the indexer cache is narrower than the model's attention (indexer_head_size, one head, K only),
+    // so it needs its own hparams; llama_kv_cache keeps a reference to what it is handed.
+    llama_hparams hparams_idx;
+
     std::unique_ptr<llama_kv_cache> kv_win;
     std::unique_ptr<llama_kv_cache> kv_comp;
+    std::unique_ptr<llama_kv_cache> kv_idx;
 };
 
 class llama_kv_cache_dsv41_context : public llama_memory_context_i {
@@ -72,6 +83,7 @@ public:
             llama_kv_cache_dsv41 * kv,
             slot_info_vec_t sinfos_win,
             slot_info_vec_t sinfos_comp,
+            slot_info_vec_t sinfos_idx,
             std::vector<llama_ubatch> ubatches);
 
     virtual ~llama_kv_cache_dsv41_context();
@@ -84,6 +96,7 @@ public:
 
     const llama_kv_cache_context * get_win () const;
     const llama_kv_cache_context * get_comp() const;
+    const llama_kv_cache_context * get_idx () const;
 
     // the compressed cache itself, for cell -> position lookups when building the group masks
     const llama_kv_cache * get_comp_cache() const { return kv_comp; }
@@ -95,6 +108,7 @@ private:
 
     const llama_memory_context_ptr ctx_win;
     const llama_memory_context_ptr ctx_comp;
+    const llama_memory_context_ptr ctx_idx;
 
     const llama_memory_status status;
 

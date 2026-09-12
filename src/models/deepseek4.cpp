@@ -1825,6 +1825,7 @@ public:
         ctx_win->set_input_kq_mask(kq_mask_win, ubatch, cparams.causal_attn);
 
         ctx_comp->set_input_k_idxs(k_idxs_comp, ubatch);
+        mctx->get_idx()->set_input_k_idxs(k_idxs_idx, ubatch);
         ctx_comp->set_input_kq_mask(kq_mask_r1, ubatch, cparams.causal_attn);
 
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1897,6 +1898,7 @@ public:
         bool res = true;
         res &= k_idxs_win ->ne[0] == n_tokens;
         res &= k_idxs_comp->ne[0] == n_tokens;
+        res &= k_idxs_idx ->ne[0] == n_tokens;
         res &= kq_mask_win->ne[0] == (int64_t) mctx_new->get_win ()->get_n_kv();
         res &= kq_mask_r1 ->ne[0] == (int64_t) mctx_new->get_comp()->get_n_kv();
         res &= kq_mask_win->ne[1] == n_tokens && kq_mask_win->ne[3] == 1;
@@ -1908,6 +1910,7 @@ public:
     ggml_tensor * kq_mask_win = nullptr; // F32/F16 [n_kv_win, n_tokens, 1, 1]
 
     ggml_tensor * k_idxs_comp = nullptr; // I64 [n_tokens]  every token's compressed cell
+    ggml_tensor * k_idxs_idx  = nullptr; // I64 [n_tokens]  same cell, in the indexer-key cache
     ggml_tensor * kq_mask_r1  = nullptr; // F32/F16 [n_kv_comp, n_tokens, 1, 1]
     ggml_tensor * kq_mask_r2  = nullptr; // F32/F16 [n_kv_comp, n_tokens, 1, 1]
 
@@ -1923,6 +1926,9 @@ llm_graph_input_dsv41 * llama_model_deepseek4::graph_v41::build_inp_dsv41() cons
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv41_context *>(mctx);
     const auto * ctx_win  = mctx_cur->get_win();
     const auto * ctx_comp = mctx_cur->get_comp();
+
+    // the indexer-key cache mirrors the compressed cache's cells, so the two must agree on n_kv
+    GGML_ASSERT(mctx_cur->get_idx()->get_n_kv() == ctx_comp->get_n_kv());
 
     auto inp = std::make_unique<llm_graph_input_dsv41>(cparams, mctx_cur);
 
@@ -1943,6 +1949,7 @@ llm_graph_input_dsv41 * llama_model_deepseek4::graph_v41::build_inp_dsv41() cons
     inp->kq_mask_win = mask(ctx_win->get_n_kv());
 
     inp->k_idxs_comp = ctx_comp->build_input_k_idxs(ctx0, ubatch);
+    inp->k_idxs_idx  = mctx_cur->get_idx()->build_input_k_idxs(ctx0, ubatch);
     inp->kq_mask_r1  = mask(ctx_comp->get_n_kv());
     inp->kq_mask_r2  = mask(ctx_comp->get_n_kv());
 
@@ -1951,6 +1958,88 @@ llm_graph_input_dsv41 * llama_model_deepseek4::graph_v41::build_inp_dsv41() cons
     inp->odd_f     = vec(GGML_TYPE_F32, 1, n_tokens);
 
     return (llm_graph_input_dsv41 *) res->add_input(std::move(inp));
+}
+
+// CSA2 indexer: score this layer's queries against the indexer keys its CED source layer published,
+// and return the indices of the best hparams.indexer_top_k compressed positions. Mirrors the DSV4
+// lightning indexer (build_lid_top_k) except that the keys live in the V4.1 indexer-key cache, whose
+// cells coincide with the compressed cache's, and the visibility mask is the compressed one.
+ggml_tensor * llama_model_deepseek4::graph_v41::build_indexer_top_k_v41(
+        const llama_model & model,
+        llm_graph_input_dsv41 * inp,
+        ggml_tensor * qr,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        int il) const {
+    const auto & layer = model.layers[il];
+
+    const int64_t n_idx_head = hparams.indexer_n_head;
+    const int64_t n_idx_dim  = hparams.indexer_head_size;
+    const int64_t n_idx_rope = hparams.n_rot();
+    const int64_t n_idx_nope = n_idx_dim - n_idx_rope;
+    const int64_t nt         = cur->ne[1];
+
+    const int src = ced_src[il];
+    GGML_ASSERT(src >= 0 && "CSA2 index layer before its kv_source");
+    GGML_ASSERT(n_idx_dim >= n_idx_rope);
+
+    ggml_tensor * idx_q = build_lora_mm(layer.indexer_attn_q_b, qr);
+    idx_q = ggml_reshape_3d(ctx0, idx_q, n_idx_dim, n_idx_head, nt);
+    idx_q = ggml_rope_ext(ctx0, idx_q, inp_pos, nullptr, n_idx_rope, rope_type, n_ctx_orig,
+            hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+            dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+    idx_q = ggml_rope_set_offset(idx_q, n_idx_nope);
+    cb(idx_q, "csa2_idx_q", il);
+
+    // one weight per head, scaled to the reference's softmax_scale * n_heads**-0.5
+    ggml_tensor * idx_w = build_lora_mm(layer.indexer_proj, cur);
+    idx_w = ggml_scale(ctx0, idx_w, 1.0f/sqrtf(float(n_idx_dim*n_idx_head)));
+    cb(idx_w, "csa2_idx_w", il);
+
+    ggml_tensor * mask  = hparams.dsv4_compress_ratios[src] == 1 ? inp->kq_mask_r1 : inp->kq_mask_r2;
+    ggml_tensor * idx_k = inp->mctx->get_idx()->get_k(ctx0, src);
+
+    const int64_t n_comp = mask->ne[0];
+    GGML_ASSERT(n_comp > 0);
+    GGML_ASSERT(n_comp <= idx_k->ne[2]);
+
+    idx_k = ggml_view_4d(ctx0, idx_k,
+            idx_k->ne[0], idx_k->ne[1], n_comp, idx_k->ne[3],
+            idx_k->nb[1], idx_k->nb[2], idx_k->nb[3], 0);
+    cb(idx_k, "csa2_idx_k_all", il);
+
+    const int64_t n_stream = idx_k->ne[3];
+    idx_q = ggml_view_4d(ctx0, idx_q,
+            idx_q->ne[0], idx_q->ne[1], idx_q->ne[2]/n_stream, n_stream,
+            idx_q->nb[1], idx_q->nb[2], idx_q->nb[3]/n_stream, 0);
+    idx_w = ggml_view_4d(ctx0, idx_w,
+            idx_w->ne[0], idx_w->ne[1]/n_stream, idx_w->ne[2], n_stream,
+            idx_w->nb[1], idx_w->nb[2]/n_stream, idx_w->nb[3]/n_stream, 0);
+
+    idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
+    idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
+
+    ggml_tensor * score = ggml_mul_mat(ctx0, idx_k, idx_q);
+    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+    score = ggml_relu(ctx0, score);
+    score = ggml_mul(ctx0, score, idx_w);
+    score = ggml_sum_rows(ctx0, score);
+    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+    // the mask is F16 under flash attention and the score is F32; the mask only ever holds 0 or -inf,
+    // so widening it is exact.
+    if (mask->type != score->type) {
+        mask = ggml_cast(ctx0, mask, score->type);
+    }
+    score = ggml_add(ctx0, score, mask);
+    cb(score, "csa2_idx_score", il);
+
+    const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
+    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
+    cb(top_k, "csa2_idx_top_k", il);
+
+    return top_k;
 }
 
 ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
@@ -2012,6 +2101,7 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
 
     const auto * ctx_win  = inp->mctx->get_win();
     const auto * ctx_comp = inp->mctx->get_comp();
+    const auto * ctx_idx  = inp->mctx->get_idx();
 
     auto rope = [&](ggml_tensor * t, ggml_tensor * pos) {
         t = ggml_rope_ext(ctx0, t, pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
@@ -2031,13 +2121,17 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
     if (ratio != 0) {
         // kv_source layers compress their own KV for their CED group into the compressed cache: the
         // reference Compressor -- ratio 1 = plain wkv + norm; ratio 2 = softmax(wgate)-weighted pool of
-        // each group of 2 tokens, norm -- then RoPE at the group position. The pre-RoPE latent is what
-        // the indexer will consume (TODO indexer/top-k, a no-op below 512 groups).
+        // each group of 2 tokens, norm -- then RoPE at the group position. The normed, pre-RoPE latent
+        // (comp_pre) is what the indexer's key projection consumes.
         if (hparams.is_kv_source_impl[il]) {
             ggml_tensor * comp = nullptr;
+            ggml_tensor * comp_pre = nullptr;   // normed compressed latent, before RoPE  [n_embd_head, nt]
+            ggml_tensor * comp_pos = nullptr;   // the positions comp was roped at
             if (ratio == 1) {
                 comp = build_lora_mm(layer.attn_comp_wkv, cur);                                    // [n_embd_head, nt]
                 comp = build_norm(comp, layer.attn_comp_norm, nullptr, LLM_NORM_RMS, il);
+                comp_pre = comp;
+                comp_pos = inp_pos;
                 comp = rope(ggml_reshape_3d(ctx0, comp, n_embd_head, 1, nt), inp_pos);
             } else {
                 GGML_ASSERT(ratio == 2);
@@ -2070,6 +2164,8 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
                 comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));                      // [n_embd_head, 1, nt]
                 comp = ggml_reshape_2d(ctx0, comp, n_embd_head, nt);
                 comp = build_norm(comp, layer.attn_comp_norm, nullptr, LLM_NORM_RMS, il);
+                comp_pre = comp;
+                comp_pos = inp->pos_grp;
                 comp = rope(ggml_reshape_3d(ctx0, comp, n_embd_head, 1, nt), inp->pos_grp);
 
                 // odd tokens store the group K at their cell; even tokens keep their parked raw wkv
@@ -2080,6 +2176,22 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
             }
             cb(comp, "ced_k", il);
             ggml_build_forward_expand(gf, ctx_comp->cpy_k(ctx0, comp, inp->k_idxs_comp, il));
+
+            // A CSA2-Full layer also publishes the indexer key for the same cell, so the layers in its
+            // group can score against it. Roped at the same positions as the compressed K it describes,
+            // so the indexer's q.k is in one rotational frame (no folded-rotation trick needed here).
+            if (layer.indexer_attn_k) {
+                const int64_t idx_head = hparams.indexer_head_size;
+                ggml_tensor * kidx = build_lora_mm(layer.indexer_attn_k, comp_pre);                // [idx_head, nt]
+                kidx = build_norm(kidx, layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
+                kidx = ggml_reshape_3d(ctx0, kidx, idx_head, 1, nt);
+                kidx = ggml_rope_ext(ctx0, kidx, comp_pos, nullptr, n_embd_head_rope, rope_type,
+                        n_ctx_orig_l, freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l,
+                        beta_fast_l, beta_slow_l);
+                kidx = ggml_rope_set_offset(kidx, idx_head - n_embd_head_rope);
+                cb(kidx, "csa2_idx_k", il);
+                ggml_build_forward_expand(gf, ctx_idx->cpy_k(ctx0, kidx, inp->k_idxs_idx, il));
+            }
         }
 
         // ONE softmax over [window ; compressed] with the sinks (the reference sparse_attn over
@@ -2088,6 +2200,20 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
         GGML_ASSERT(src >= 0 && "CED consumer layer before its kv_source");
         ggml_tensor * k_comp = ctx_comp->get_k(ctx0, src);                                         // [n_embd_head, 1, n_kv_comp, 1]
         ggml_tensor * m_comp = hparams.dsv4_compress_ratios[src] == 1 ? inp->kq_mask_r1 : inp->kq_mask_r2;
+
+        // An index_source layer picks the best indexer_top_k compressed positions; the layers after it
+        // in the same group reuse that selection (the reference Reindex behaviour). Below the top-k the
+        // selection covers everything visible and this is a no-op.
+        // DSV41_NO_IDX_TOPK=1 reverts to the pre-M9 behaviour (attend every visible compressed
+        // position) so the top-k can be A/B'd against it inside one build.
+        static const bool no_idx_topk = getenv("DSV41_NO_IDX_TOPK") != nullptr;
+        if (!no_idx_topk && hparams.is_index_source_impl[il]) {
+            csa2_top_k = build_indexer_top_k_v41(model, inp, qr, cur, inp_pos, il);
+        }
+        if (csa2_top_k) {
+            m_comp = build_top_k_mask(m_comp, csa2_top_k, "csa2_kq_mask_top_k", il);
+        }
+
         if (k_comp->type != k_all->type) { k_comp = ggml_cast(ctx0, k_comp, k_all->type); }
         k_all   = ggml_concat(ctx0, k_all, k_comp, 2);
         kq_mask = ggml_concat(ctx0, kq_mask, m_comp, 0);
