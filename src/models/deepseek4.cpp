@@ -2221,7 +2221,19 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
         cb(kq_mask, "csa2_kq_mask", il);
     }
 
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, 0, kq_scale, il);
+    // With a top-k selection the mask leaves at most (sliding window + indexer_top_k) positions
+    // unmasked per query, however long the compressed stream is. Handing that bound to
+    // ggml_flash_attn_ext lets the kernel stop scanning there instead of walking all of k_all --
+    // 640 positions instead of 33 792 at a 32K context. 0 means "no bound" (the pure-window layers,
+    // and the DSV41_NO_IDX_TOPK path, where every visible position really can be unmasked).
+    // DSV41_NO_FA_KV_MAX=1 disables just the bound (keeping the top-k) so the two can be compared
+    // bit-for-bit on the CUDA path. The CPU backend ignores n_kv_max entirely, so a CPU run cannot
+    // validate it -- an under-sized bound would silently drop unmasked positions.
+    static const bool no_fa_kv_max = getenv("DSV41_NO_FA_KV_MAX") != nullptr;
+    const int64_t n_kv_max = (csa2_top_k && !no_fa_kv_max)
+        ? std::min<int64_t>(inp->kq_mask_win->ne[0], hparams.n_swa) + csa2_top_k->ne[0]
+        : 0;
+    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
     cb(out, ratio != 0 ? "attn_csa2" : "attn_window", il);
 
     out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
@@ -2309,6 +2321,7 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
         build_hc_mixes(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base,
                 &attn_pre, &attn_post, &attn_comb, il);
 
+        cb(pre_mix, "hc_pre_mix", il);                 // the gates themselves, for the oracle diff
         cur = build_hc_pre(inpL, pre_mix, il);          // the previous sublayer's mix
         cb(cur, "hc_attn_pre", il);
 
