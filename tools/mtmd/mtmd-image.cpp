@@ -1150,7 +1150,7 @@ clip_image_size mtmd_image_preprocessor_deepseekocr::find_closest_aspect_ratio(
 //
 
 // ref: grid_tokens()
-mtmd_image_preprocessor_deepseek4v::grid_info mtmd_image_preprocessor_deepseek4v::grid_tokens(int best_height, int best_width, int patch_size, int r) {
+mtmd_image_preprocessor_deepseek4v::grid_info mtmd_image_preprocessor_deepseek4v::grid_tokens(int best_height, int best_width, int patch_size, int r) const {
     grid_info g;
     g.n_llm_h = ((best_height / patch_size) + r - 1) / r;
     g.n_llm_w = ((best_width  / patch_size) + r - 1) / r;
@@ -1160,7 +1160,7 @@ mtmd_image_preprocessor_deepseek4v::grid_info mtmd_image_preprocessor_deepseek4v
 
 // ref: solve_resize_ratio()
 void mtmd_image_preprocessor_deepseek4v::solve_resize_ratio(int height, int width, int p, int r, int max_n_token,
-                                                            int & best_height, int & best_width) {
+                                                            int & best_height, int & best_width) const {
     const double ratio   = (double) height / width;
     const double max_w_f = std::sqrt((max_n_token - 2) / ratio + 0.25) - 0.5;
     const double max_h_f = max_w_f * ratio;
@@ -1194,7 +1194,7 @@ void mtmd_image_preprocessor_deepseek4v::solve_resize_ratio(int height, int widt
 
 // ref: safe_resize()
 void mtmd_image_preprocessor_deepseek4v::safe_resize(int height, int width, int & best_height, int & best_width,
-                                                     int p, int r, int max_n_token) {
+                                                     int p, int r, int max_n_token) const {
     max_n_token -= 4 - 1; // reserve room for the position-dependent lead pads (COMPRESS_PAD_TO - 1)
     grid_info g = grid_tokens(best_height, best_width, p, r);
     int budget = max_n_token;
@@ -1242,6 +1242,71 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip
 
     out.append(hparams, resized);
     return out;
+}
+
+//
+// DeepSeek-V4.1-Flash (deepseek41v)
+//
+// The pixel pipeline and preprocess() are inherited from V4. Only the resize plan changes: the
+// V4.1 token block is [START] + ([IMAGE]*w + [NEWLINE])*h + [END], so there is no even-row
+// requirement and no lead-pad reserve to subtract from the budget.
+// ref: llm_grid / solve_resize_ratio / safe_resize in inference/image_processor.py
+//
+
+// ref: llm_grid() + num_image_tokens()
+mtmd_image_preprocessor_deepseek4v::grid_info
+mtmd_image_preprocessor_deepseek41v::grid_tokens(int best_height, int best_width, int patch_size, int r) const {
+    grid_info g;
+    g.n_llm_h = ((best_height / patch_size) + r - 1) / r;
+    g.n_llm_w = ((best_width  / patch_size) + r - 1) / r;
+    g.n_tokens = dsv41_n_image_tokens(g.n_llm_w, g.n_llm_h);
+    return g;
+}
+
+// ref: solve_resize_ratio()
+void mtmd_image_preprocessor_deepseek41v::solve_resize_ratio(int height, int width, int p, int r, int max_n_token,
+                                                             int & best_height, int & best_width) const {
+    const double ratio   = (double) height / width;
+    const double max_w_f = std::sqrt((max_n_token - 2) / ratio + 0.25) - 0.5;
+    const double max_h_f = max_w_f * ratio;
+    const int    cell    = p * r;
+    if (max_w_f < 1.0) {
+        // very tall: collapse to a single column, row_len is then 2
+        best_height = (max_n_token - 2) / 2 * cell;
+        best_width  = cell;
+    } else if (max_h_f < 1.0) {
+        // very wide: collapse to a single row
+        best_height = cell;
+        best_width  = (max_n_token - 3) * cell;
+    } else {
+        const double beta = std::min(
+            std::floor(max_w_f) * cell / width,
+            std::floor(max_h_f) * cell / height);
+        best_height = (int) std::floor(height * beta / p) * p;
+        best_width  = (int) std::floor(width  * beta / p) * p;
+    }
+}
+
+// ref: safe_resize()
+void mtmd_image_preprocessor_deepseek41v::safe_resize(int height, int width, int & best_height, int & best_width,
+                                                      int p, int r, int max_n_token) const {
+    grid_info g = grid_tokens(best_height, best_width, p, r);
+    if (g.n_tokens <= max_n_token) {
+        return;
+    }
+    solve_resize_ratio(height, width, p, r, max_n_token, best_height, best_width);
+    g = grid_tokens(best_height, best_width, p, r);
+    // the reference asserts the single pass is enough. shrink rather than abort if it ever is not
+    // (an over-budget block would overrun the layout index), and say so.
+    int budget = max_n_token;
+    while (g.n_tokens > max_n_token && budget > 8) {
+        LOG_WRN("%s: dsv41 resize solver over budget (%d > %d), retrying at %d\n",
+                __func__, g.n_tokens, max_n_token, budget - 1);
+        budget -= 1;
+        solve_resize_ratio(height, width, p, r, budget, best_height, best_width);
+        g = grid_tokens(best_height, best_width, p, r);
+    }
+    GGML_ASSERT(g.n_tokens <= max_n_token);
 }
 
 mtmd_image_preproc_out mtmd_image_preprocessor_deepseekocr::preprocess(const clip_image_u8 & img) const {

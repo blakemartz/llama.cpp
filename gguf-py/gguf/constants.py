@@ -373,6 +373,8 @@ class Keys:
         PROJECTOR_TYPE        = "clip.vision.projector_type" # for mixed modality models
         IMAGE_SIZE            = "clip.vision.image_size"
         IMAGE_MIN_PIXELS      = "clip.vision.image_min_pixels"
+        MAX_N_TOKEN           = "clip.vision.max_n_token"
+        MAX_WH_RATIO          = "clip.vision.max_wh_ratio"
         IMAGE_MAX_PIXELS      = "clip.vision.image_max_pixels"
         PREPROC_MIN_TILES     = "clip.vision.preproc_min_tiles"
         PREPROC_MAX_TILES     = "clip.vision.preproc_max_tiles"
@@ -5818,6 +5820,7 @@ class VisionProjectorType:
     DEEPSEEKOCR = "deepseekocr"
     DEEPSEEKOCR2 = "deepseekocr2"
     DEEPSEEK4V = "deepseek4v"
+    DEEPSEEK41V = "deepseek41v"
     LFM2A = "lfm2a" # audio
     MUSIC_FLAMINGO = "musicflamingo" # audio
     GLM4V = "glm4v"

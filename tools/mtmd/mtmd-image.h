@@ -134,15 +134,28 @@ struct mtmd_image_preprocessor_deepseek4v : mtmd_image_preprocessor {
     mtmd_image_preprocessor_deepseek4v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 
-private:
+protected:
+    // the resize plan is the only thing V4.1 changes; preprocess() itself is shared
     struct grid_info {
         int n_llm_h;
         int n_llm_w;
         int n_tokens; // token count of the block (incl. newline/pad rows and start/end, excl. lead pads)
     };
-    static grid_info grid_tokens(int best_height, int best_width, int patch_size, int r);
-    static void solve_resize_ratio(int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width);
-    static void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token);
+    virtual grid_info grid_tokens(int best_height, int best_width, int patch_size, int r) const;
+    virtual void solve_resize_ratio(int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width) const;
+    virtual void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token) const;
+};
+
+// DeepSeek-V4.1-Flash: same ViT, aligner and pixel pipeline as V4, but the token block is plain
+// reading order, so the resize solver drops V4's even-row requirement and lead-pad reserve.
+// ref: solve_resize_ratio / safe_resize / llm_grid in inference/image_processor.py
+struct mtmd_image_preprocessor_deepseek41v : mtmd_image_preprocessor_deepseek4v {
+    using mtmd_image_preprocessor_deepseek4v::mtmd_image_preprocessor_deepseek4v;
+
+protected:
+    grid_info grid_tokens(int best_height, int best_width, int patch_size, int r) const override;
+    void solve_resize_ratio(int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width) const override;
+    void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token) const override;
 };
 
 // custom llava-uhd slicing logic for MiniCPM-V

@@ -51,6 +51,8 @@
 #define KEY_VISION_PROJ_TYPE        "clip.vision.projector_type" // for models with mixed modalities
 #define KEY_IMAGE_SIZE              "clip.vision.image_size"
 #define KEY_IMAGE_MIN_PIXELS        "clip.vision.image_min_pixels"
+#define KEY_VISION_MAX_N_TOKEN      "clip.vision.max_n_token"
+#define KEY_VISION_MAX_WH_RATIO     "clip.vision.max_wh_ratio"
 #define KEY_IMAGE_MAX_PIXELS        "clip.vision.image_max_pixels"
 #define KEY_PREPROC_MIN_TILES       "clip.vision.preproc_min_tiles"
 #define KEY_PREPROC_MAX_TILES       "clip.vision.preproc_max_tiles"
@@ -484,6 +486,7 @@ enum projector_type {
     PROJECTOR_TYPE_DEEPSEEKOCR,
     PROJECTOR_TYPE_DEEPSEEKOCR2,
     PROJECTOR_TYPE_DEEPSEEK4V,
+    PROJECTOR_TYPE_DEEPSEEK41V,
     PROJECTOR_TYPE_LFM2A,
     PROJECTOR_TYPE_GLM4V,
     PROJECTOR_TYPE_YOUTUVL,
@@ -549,6 +552,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_DEEPSEEKOCR,       "deepseekocr"},
     { PROJECTOR_TYPE_DEEPSEEKOCR2,      "deepseekocr2"},
     { PROJECTOR_TYPE_DEEPSEEK4V,        "deepseek4v"},
+    { PROJECTOR_TYPE_DEEPSEEK41V,       "deepseek41v"},
     { PROJECTOR_TYPE_LFM2A,             "lfm2a"},
     { PROJECTOR_TYPE_GLM4V,             "glm4v"},
     { PROJECTOR_TYPE_YOUTUVL,           "youtuvl"},
@@ -793,6 +797,16 @@ static inline dsv4_block_layout dsv4_get_block_layout(int n_llm_w, int n_llm_h, 
     bl.pad_last = (bl.rows / 2 * bl.row_len) % 2 * 2;
     bl.n_out    = lead_pad + 1 + bl.rows * bl.row_len + bl.pad_last + 1;
     return bl;
+}
+
+// DeepSeek-V4.1 keeps the same ViT and aligner but a much plainer token block:
+//
+//   [IMAGE_START] + ([IMAGE] * n_llm_w + [IMAGE_NEW_LINE]) * n_llm_h + [IMAGE_END]
+//
+// reading order, one newline per row, no lead pad, no row-pair interleave and no PAD
+// sentinel. ref: num_image_tokens() / image_token_types() in inference/image_processor.py
+static inline int dsv41_n_image_tokens(int n_llm_w, int n_llm_h) {
+    return n_llm_h * (n_llm_w + 1) + 2;
 }
 
 //

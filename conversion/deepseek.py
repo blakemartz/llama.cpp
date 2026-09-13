@@ -1041,6 +1041,8 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
 @ModelBase.register("DeepseekV4ForCausalLM")
 @ModelBase.example("deepseek-ai/DeepSeek-V4-Flash-Vision-Exp")
 class DeepseekV4FlashVisionModel(MmprojModel):
+    projector_type = gguf.VisionProjectorType.DEEPSEEK4V
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.hparams_vision is not None
@@ -1072,17 +1074,22 @@ class DeepseekV4FlashVisionModel(MmprojModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         assert self.hparams_vision is not None
-        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.DEEPSEEK4V)
+        self.gguf_writer.add_clip_projector_type(self.projector_type)
         # vision RMSNorm eps is the pytorch default, NOT the LLM's rms_norm_eps (1e-20)
         # ref: inference/vision.py (RMSNorm)
         self.gguf_writer.add_vision_attention_layernorm_eps(1e-6)
         self.gguf_writer.add_vision_use_silu(True) # SwiGLU MLP
         self.gguf_writer.add_vision_projector_scale_factor(self.hparams_vision["downsample_ratio"])
         self.gguf_writer.add_vision_min_pixels(self.hparams_vision["min_pixels"])
-        # hardcoded on the C++ side (see PROJECTOR_TYPE_DEEPSEEK4V in clip.cpp)
-        # if future models use different values, add GGUF keys for those
-        assert self.global_config["vision_max_n_token"] == 384
-        assert self.global_config["vision_max_wh_ratio"] == 8
+        # the resize solver's token budget and aspect clamp. V4 hardcoded these on the C++
+        # side; they are GGUF keys now because V4.1 uses different values (1024 / none).
+        max_n_token, max_wh_ratio = self.get_resize_limits()
+        self.gguf_writer.add_vision_max_n_token(max_n_token)
+        self.gguf_writer.add_vision_max_wh_ratio(max_wh_ratio)
+
+    def get_resize_limits(self) -> tuple[int, int]:
+        """(max_n_token, max_wh_ratio); a ratio of 0 means no aspect clamp."""
+        return self.global_config["vision_max_n_token"], self.global_config["vision_max_wh_ratio"]
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
@@ -1106,6 +1113,40 @@ class DeepseekV4FlashVisionModel(MmprojModel):
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("DeepseekV41ForCausalLM")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash")
+class DeepseekV41FlashVisionModel(DeepseekV4FlashVisionModel):
+    """DeepSeek V4.1 vision tower. Same ViT and aligner as V4, three differences:
+
+      * the vision hyperparameters live in a nested `vision_config` with HF-standard
+        names, so the inherited get_vision_config() override is dropped in favour of
+        MmprojModel's default
+      * the LLM token block is plain reading order with three sentinels, where V4
+        pads, interleaves row pairs and carries a fourth (PAD) sentinel -- hence a
+        separate projector type rather than a flag
+      * the resize budget is 1024 LLM tokens with no aspect clamp (V4: 384 and 8:1)
+
+    ref: inference/vision.py, inference/image_processor.py in the HF repo
+    """
+
+    projector_type = gguf.VisionProjectorType.DEEPSEEK41V
+
+    def get_vision_config(self) -> dict[str, Any] | None:
+        cfg = super(DeepseekV4FlashVisionModel, self).get_vision_config()
+        if cfg is None:
+            raise ValueError("DeepseekV41FlashVisionModel requires a vision_config block")
+        # dynamic resolution: image_size is only used for compat / warmup allocation
+        return {
+            **cfg,
+            "image_size": cfg["patch_size"] * cfg["downsample_ratio"] * 16,
+        }
+
+    def get_resize_limits(self) -> tuple[int, int]:
+        assert self.hparams_vision is not None
+        # max_wh_ratio is null in the shipped config; 0 disables the clamp on the C++ side
+        return self.hparams_vision["max_image_tokens"], self.hparams_vision.get("max_wh_ratio") or 0
 
 
 @ModelBase.register("DeepseekV41ForCausalLM")

@@ -831,6 +831,16 @@ struct mtmd_context {
                     // no vocab tokens are added; the start/end/newline markers are learned embeddings emitted by the encoder
                     image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4v>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_DEEPSEEK41V:
+                {
+                    // as V4: the start/end/newline markers are learned embeddings from the encoder,
+                    // no vocab tokens. unlike V4 there is no block alignment and no PAD sentinel,
+                    // and the image span stays CAUSAL -- the V4.1 reference never hands attention an
+                    // image mask (Attention.forward takes only x and start_pos; the mask comes from
+                    // the window and compressor alone), so DEEPSEEK41V is deliberately absent from
+                    // mtmd_decode_use_non_causal. ref: inference/model.py
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek41v>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_DOTS_OCR:
             case PROJECTOR_TYPE_DOTS3NOTE_V:
                 {

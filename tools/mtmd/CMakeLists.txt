@@ -31,6 +31,7 @@ add_library(mtmd
             models/cogvlm.cpp
             models/conformer.cpp
             models/deepseek4v.cpp
+            models/deepseek41v.cpp
             models/dots3note.cpp
             models/dotsocr.cpp
             models/exaone4_5.cpp

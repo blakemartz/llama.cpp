@@ -1645,6 +1645,12 @@ struct dsv41_engram_consts {
 
 class llm_graph_input_dsv41_engram : public llm_graph_input_i {
 public:
+    // A position with no token id (an image span: llama.cpp delivers those as an embedding-only
+    // ubatch) is a "dead" token for the engram. The reference caches it as DEAD, look-back stops
+    // there so no n-gram ever spans an image, and the engram gate is forced to 0 so the position
+    // passes through untouched. ref: NgramHashState / Engram.forward in inference/{engram,model}.py
+    static constexpr int32_t DEAD = -1;
+
     llm_graph_input_dsv41_engram(std::vector<int32_t> layer_ids, int64_t n_hash_cols) :
         layer_ids(std::move(layer_ids)), n_hash_cols(n_hash_cols) {}
 
@@ -1656,7 +1662,8 @@ public:
     void set_input_hashed(const llama_ubatch * ubatch) {
         const auto & c = dsv41_engram_consts::get();
         GGML_ASSERT(c.loaded && "set DSV41_ENGRAM_CONSTS=<dir> (or DSV41_ENGRAM_HASHES for a precomputed table)");
-        GGML_ASSERT(ubatch->token && "engram hasher needs token ids");
+        // no token ids => an image span; every position in this ubatch is DEAD (see above)
+        const bool is_image = ubatch->token == nullptr;
         static std::map<int32_t, std::vector<int32_t>> hist;   // seq_id -> compressed id per position
         const int64_t n_tokens = ubatch->n_tokens;
         const int32_t G = c.max_ngram, H = c.n_heads;
@@ -1668,13 +1675,20 @@ public:
             auto & h = hist[seq];
             if (pos == 0) { h.clear(); }
             if ((int64_t) h.size() <= pos) { h.resize(pos + 1, c.pad_id); }
-            const llama_token tok = ubatch->token[t];
-            GGML_ASSERT(tok >= 0 && (size_t) tok < c.token_map.size());
-            h[pos] = c.token_map[tok];
+            if (is_image) {
+                h[pos] = DEAD;
+            } else {
+                const llama_token tok = ubatch->token[t];
+                GGML_ASSERT(tok >= 0 && (size_t) tok < c.token_map.size());
+                h[pos] = c.token_map[tok];
+            }
+            // once blocked, stay blocked: the sequence start and any dead token both end the look-back
             std::vector<int64_t> toks(G);
+            bool blocked = false;
             for (int32_t sh = 0; sh < G; ++sh) {
                 const int64_t p = pos - sh;
-                toks[sh] = (p < 0) ? c.pad_id : h[p];
+                blocked = blocked || p < 0 || h[p] == DEAD;
+                toks[sh] = blocked ? c.pad_id : h[p];
             }
             for (size_t li = 0; li < layer_ids.size(); ++li) {
                 const int64_t * mult = &c.multipliers[li * G];
@@ -1695,6 +1709,11 @@ public:
     }
 
     void set_input(const llama_ubatch * ubatch) override {
+        if (text_mask) {
+            // uniform per ubatch: llama.cpp never mixes token and embedding rows in one ubatch
+            const std::vector<float> m((size_t) ubatch->n_tokens, ubatch->token ? 1.0f : 0.0f);
+            ggml_backend_tensor_set(text_mask, m.data(), 0, m.size() * sizeof(float));
+        }
         const char * path = getenv("DSV41_ENGRAM_HASHES");
         if (!path) {
             set_input_hashed(ubatch);
@@ -1737,12 +1756,16 @@ public:
             res &= t->ne[0] == n_hash_cols;
             res &= t->ne[1] == n_tokens;
         }
+        if (text_mask) {
+            res &= text_mask->ne[1] == n_tokens;
+        }
         return res;
     }
 
     std::vector<int32_t> layer_ids;                 // engram layers in order (index = layer_hash_index)
     int64_t n_hash_cols;
     std::vector<ggml_tensor *> hashes;              // I32 [n_hash_cols, n_tokens] per engram layer
+    ggml_tensor * text_mask = nullptr;              // F32 [1, n_tokens]: 1 for text, 0 for image spans
     std::vector<int32_t> table;
     size_t n_pos_file = 0;
 };
@@ -1750,6 +1773,7 @@ public:
 ggml_tensor * llama_model_deepseek4::graph_v41::build_engram(
         const llama_model & model,
         ggml_tensor * hashes,
+        ggml_tensor * text_mask,
         ggml_tensor * x,
         int il) const {
     const auto & layer = model.layers[il];
@@ -1792,6 +1816,10 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_engram(
         dot = ggml_scale(ctx0, dot, 1.0f/sqrtf((float) n_embd));
         ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY));
         ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, dot), mag)); // [1, nt]
+        if (text_mask) {
+            // image-span positions take no engram contribution (reference: gate.masked_fill(~mask, 0))
+            gate = ggml_mul(ctx0, gate, text_mask);
+        }
 
         ggml_tensor * ys = ggml_add(ctx0, xs, ggml_mul(ctx0, val, gate));        // x + gate * value
         ys = ggml_reshape_3d(ctx0, ggml_cont(ctx0, ys), n_embd, 1, nt);
@@ -2292,6 +2320,10 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
             ggml_set_input(t);
             inp->hashes.push_back(t);
         }
+        // 1 for text, 0 for an image span: shuts the engram gate so those positions pass through
+        inp->text_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_input(inp->text_mask);
+        ggml_set_name(inp->text_mask, "engram_text_mask");
         inp_engram = (llm_graph_input_dsv41_engram *) res->add_input(std::move(inp));
     }
 
@@ -2313,7 +2345,7 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
 
         if (hparams.is_engram_impl[il]) {
             const size_t li = std::find(engram_layers.begin(), engram_layers.end(), il) - engram_layers.begin();
-            inpL = build_engram(model, inp_engram->hashes[li], inpL, il);
+            inpL = build_engram(model, inp_engram->hashes[li], inp_engram->text_mask, inpL, il);
         }
 
         ggml_tensor * residual = inpL;

@@ -1341,6 +1341,7 @@ struct llama_model_deepseek4 : public llama_model_base {
         ggml_tensor * build_engram(
                 const llama_model & model,
                 ggml_tensor * hashes,
+                ggml_tensor * text_mask,
                 ggml_tensor * x,
                 int il) const;
 
