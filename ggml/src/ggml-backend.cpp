@@ -28,6 +28,15 @@
 #include <sys/sysctl.h>
 #endif
 
+#if defined(__linux__) && !defined(GGML_USE_CPU_HBM)
+// transparent huge pages for large CPU buffers, see ggml_backend_cpu_buffer_alloc
+#include <errno.h>
+#include <sys/mman.h>
+#ifdef MADV_HUGEPAGE
+#define GGML_CPU_THP_SUPPORTED 1
+#endif
+#endif
+
 
 // backend buffer type
 
@@ -2437,8 +2446,97 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
     GGML_UNUSED(buft);
 }
 
+// CPU buffers holding weights are streamed through the TLB on every token; with 4 KiB pages a MoE model of a few
+// hundred GiB costs ~0.5 M TLB misses per token. On Linux, /sys/kernel/mm/transparent_hugepage/enabled = madvise
+// (the usual distro default) only backs anonymous memory with huge pages after madvise(MADV_HUGEPAGE), and
+// glibc's malloc never asks for it. So buffers of at least GGML_CPU_THP_MIN_SIZE are allocated aligned to the
+// huge page (PMD) size, so that every huge-page slot of the buffer is eligible, and advised. The pages are
+// materialized by the first write (the model load), which is where any compaction cost lands.
+// GGML_CPU_NO_THP=1 disables this. Smaller buffers, HBM and non-Linux keep ggml_aligned_malloc; the matching
+// free stays ggml_aligned_free, which is free() on this path.
+#define GGML_CPU_THP_MIN_SIZE (64ull*1024*1024)
+
+#ifdef GGML_CPU_THP_SUPPORTED
+struct ggml_cpu_thp_state {
+    bool   enabled  = false;
+    size_t pmd_size = 2ull*1024*1024;
+};
+
+static const ggml_cpu_thp_state & ggml_cpu_thp_get_state() {
+    static const ggml_cpu_thp_state state = [] {
+        const char * func = "ggml_backend_cpu_buffer_alloc"; // __func__ inside the lambda would be "operator()"
+        ggml_cpu_thp_state st;
+
+        const char * env = getenv("GGML_CPU_NO_THP");
+        if (env && env[0] != '\0' && strcmp(env, "0") != 0) {
+            GGML_LOG_INFO("%s: transparent huge pages disabled by GGML_CPU_NO_THP for CPU buffers >= %llu MiB\n",
+                func, (unsigned long long) (GGML_CPU_THP_MIN_SIZE/(1024*1024)));
+            return st;
+        }
+
+        char policy[128] = "unavailable";
+        FILE * f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+        if (!f) {
+            GGML_LOG_INFO("%s: transparent huge pages unavailable (no /sys/kernel/mm/transparent_hugepage), CPU buffers use 4 KiB pages\n", func);
+            return st;
+        }
+        if (fgets(policy, sizeof(policy), f)) {
+            policy[strcspn(policy, "\n")] = '\0';
+        }
+        fclose(f);
+
+        // "always [madvise] never": the kernel ignores MADV_HUGEPAGE when the selected policy is never, so do not
+        // pay the alignment or claim huge pages in that case
+        if (strstr(policy, "[never]")) {
+            GGML_LOG_INFO("%s: transparent huge pages disabled by the kernel (transparent_hugepage/enabled '%s'), CPU buffers use 4 KiB pages\n",
+                func, policy);
+            return st;
+        }
+
+        f = fopen("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", "r");
+        if (f) {
+            unsigned long long v = 0;
+            if (fscanf(f, "%llu", &v) == 1 && v >= 4096 && (v & (v - 1)) == 0 && v <= GGML_CPU_THP_MIN_SIZE) {
+                st.pmd_size = (size_t) v;
+            }
+            fclose(f);
+        }
+
+        st.enabled = true;
+        GGML_LOG_INFO("%s: transparent huge pages: madvise(MADV_HUGEPAGE) on CPU buffers >= %llu MiB, %zu KiB huge pages, "
+            "kernel policy '%s' (set GGML_CPU_NO_THP=1 to disable)\n",
+            func, (unsigned long long) (GGML_CPU_THP_MIN_SIZE/(1024*1024)), st.pmd_size/1024, policy);
+        return st;
+    }();
+    return state;
+}
+#endif // GGML_CPU_THP_SUPPORTED
+
+static void * ggml_backend_cpu_buffer_alloc(size_t size) {
+#ifdef GGML_CPU_THP_SUPPORTED
+    if (size >= GGML_CPU_THP_MIN_SIZE) {
+        const ggml_cpu_thp_state & st = ggml_cpu_thp_get_state();
+        if (st.enabled) {
+            void * data = NULL;
+            if (posix_memalign(&data, st.pmd_size, size) == 0 && data != NULL) {
+                if (madvise(data, size, MADV_HUGEPAGE) != 0) {
+                    static bool warned = false;
+                    if (!warned) {
+                        warned = true;
+                        GGML_LOG_WARN("%s: madvise(MADV_HUGEPAGE) failed: %s, CPU buffers use 4 KiB pages\n", __func__, strerror(errno));
+                    }
+                }
+                return data;
+            }
+            // fall through: ggml_aligned_malloc retries with the default alignment and reports the failure
+        }
+    }
+#endif
+    return ggml_aligned_malloc(size);
+}
+
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * data = ggml_aligned_malloc(size);
+    void * data = ggml_backend_cpu_buffer_alloc(size);
 
     if (data == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);
