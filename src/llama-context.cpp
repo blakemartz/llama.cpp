@@ -2579,8 +2579,13 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // is no CPU split left to keep this in. LLAMA_MOE_SUM_ON_EXPERTS=0 disables it entirely.
         {
             static const bool moe_sum_on_experts = []() {
+                // OFF by default (2026-09-14): in-model on DeepSeek-V4.1-Flash the pinned sum is one f32 ulp off
+                // at the first CPU-expert layer, as expected, but the outputs then diverge to a 2 % median
+                // per-token difference by ten layers later (KLD 1.5e-3 vs the unpinned build) while the
+                // scheduler changes alone stay bit-identical. Until that growth is understood, opt in with
+                // LLAMA_MOE_SUM_ON_EXPERTS=1.
                 const char * env = getenv("LLAMA_MOE_SUM_ON_EXPERTS");
-                return env == nullptr || atoi(env) != 0;
+                return env != nullptr && atoi(env) != 0;
             }();
 
             if (moe_sum_on_experts && backend_cpu && !cparams.op_offload &&
