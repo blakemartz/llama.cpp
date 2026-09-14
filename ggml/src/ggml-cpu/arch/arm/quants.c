@@ -746,6 +746,50 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const voi
     *s = sumf;
 }
 
+#if defined(__ARM_FEATURE_DOTPROD)
+// e8m0 -> f32 half for four codes at once, bit-exact with ggml_e8m0_to_fp32_half: 2^(e-128) is the pattern
+// (e-1) << 23 for e >= 2, and the denormal 0x00200000 << e for e < 2
+static inline float32x4_t ggml_e8m0x4_to_fp32_half(uint32x4_t e32) {
+    const uint32x4_t norm = vshlq_n_u32(vsubq_u32(e32, vdupq_n_u32(1)), 23);
+    const uint32x4_t den  = vshlq_u32(vdupq_n_u32(0x00200000), vreinterpretq_s32_u32(e32));
+    return vreinterpretq_f32_u32(vbslq_u32(vcltq_u32(e32, vdupq_n_u32(2)), den, norm));
+}
+
+// 4 consecutive blocks of one row: int8 dot products via sdot, the 4 block sums reduced pairwise into one vector,
+// then scaled by the e8m0 and q8_0 deltas of the 4 blocks and accumulated (one fma per 4 blocks)
+static inline float32x4_t ggml_vec_dot_mxfp4_q8_0_4blk(const block_mxfp4 * GGML_RESTRICT x, const block_q8_0 * GGML_RESTRICT y,
+        const int8x16_t values, const uint8x16_t m4b, float32x4_t sumv) {
+    const uint8x16_t q0 = vld1q_u8(x[0].qs);
+    const uint8x16_t q1 = vld1q_u8(x[1].qs);
+    const uint8x16_t q2 = vld1q_u8(x[2].qs);
+    const uint8x16_t q3 = vld1q_u8(x[3].qs);
+
+    const int32x4_t p0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vqtbl1q_s8(values, vandq_u8(q0, m4b)), vld1q_s8(y[0].qs)), vqtbl1q_s8(values, vshrq_n_u8(q0, 4)), vld1q_s8(y[0].qs + 16));
+    const int32x4_t p1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vqtbl1q_s8(values, vandq_u8(q1, m4b)), vld1q_s8(y[1].qs)), vqtbl1q_s8(values, vshrq_n_u8(q1, 4)), vld1q_s8(y[1].qs + 16));
+    const int32x4_t p2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vqtbl1q_s8(values, vandq_u8(q2, m4b)), vld1q_s8(y[2].qs)), vqtbl1q_s8(values, vshrq_n_u8(q2, 4)), vld1q_s8(y[2].qs + 16));
+    const int32x4_t p3 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vqtbl1q_s8(values, vandq_u8(q3, m4b)), vld1q_s8(y[3].qs)), vqtbl1q_s8(values, vshrq_n_u8(q3, 4)), vld1q_s8(y[3].qs + 16));
+
+    // [sum0, sum1, sum2, sum3]
+    const int32x4_t sumi = vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3));
+
+    uint8x16_t e8 = vdupq_n_u8(0);
+    e8 = vld1q_lane_u8(&x[0].e, e8,  0);
+    e8 = vld1q_lane_u8(&x[1].e, e8,  4);
+    e8 = vld1q_lane_u8(&x[2].e, e8,  8);
+    e8 = vld1q_lane_u8(&x[3].e, e8, 12);
+    const float32x4_t dx = ggml_e8m0x4_to_fp32_half(vreinterpretq_u32_u8(e8));
+
+    uint16x4_t d16 = vdup_n_u16(0);
+    d16 = vld1_lane_u16(&y[0].d, d16, 0);
+    d16 = vld1_lane_u16(&y[1].d, d16, 1);
+    d16 = vld1_lane_u16(&y[2].d, d16, 2);
+    d16 = vld1_lane_u16(&y[3].d, d16, 3);
+    const float32x4_t dy = vcvt_f32_f16(vreinterpret_f16_u16(d16));
+
+    return vfmaq_f32(sumv, vmulq_f32(dx, dy), vcvtq_f32_s32(sumi));
+}
+#endif
+
 void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
@@ -762,6 +806,23 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     int ib = 0;
     float sumf = 0;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+    {
+        const int8x16_t  values = vld1q_s8(kvalues_mxfp4);
+        const uint8x16_t m4b    = vdupq_n_u8(0x0f);
+
+        float32x4_t sumv_0 = vdupq_n_f32(0.0f);
+        float32x4_t sumv_1 = vdupq_n_f32(0.0f);
+
+        for (; ib + 7 < nb; ib += 8) {
+            sumv_0 = ggml_vec_dot_mxfp4_q8_0_4blk(x + ib + 0, y + ib + 0, values, m4b, sumv_0);
+            sumv_1 = ggml_vec_dot_mxfp4_q8_0_4blk(x + ib + 4, y + ib + 4, values, m4b, sumv_1);
+        }
+
+        sumf = vaddvq_f32(vaddq_f32(sumv_0, sumv_1));
+    }
+#endif
 
 #if defined __ARM_NEON
     const int8x16_t values = vld1q_s8(kvalues_mxfp4);
@@ -805,6 +866,102 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         sumf += d * (sumi1 + sumi2);
     }
     *s = sumf;
+}
+
+#if defined(__ARM_FEATURE_DOTPROD)
+// one column of 4 weight blocks already unpacked into wl/wh: 8 sdot, the 4 block sums reduced into one vector, then
+// scaled by the e8m0 (dx, shared by every column) and the four q8_0 deltas of this column
+static inline float32x4_t ggml_vec_dot_mxfp4_q8_0_4blk_col(const int8x16_t * GGML_RESTRICT wl, const int8x16_t * GGML_RESTRICT wh,
+        const block_q8_0 * GGML_RESTRICT y, const float32x4_t dx, float32x4_t sumv) {
+    const int32x4_t p0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), wl[0], vld1q_s8(y[0].qs)), wh[0], vld1q_s8(y[0].qs + 16));
+    const int32x4_t p1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), wl[1], vld1q_s8(y[1].qs)), wh[1], vld1q_s8(y[1].qs + 16));
+    const int32x4_t p2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), wl[2], vld1q_s8(y[2].qs)), wh[2], vld1q_s8(y[2].qs + 16));
+    const int32x4_t p3 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), wl[3], vld1q_s8(y[3].qs)), wh[3], vld1q_s8(y[3].qs + 16));
+
+    const int32x4_t sumi = vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3));
+
+    uint16x4_t d16 = vdup_n_u16(0);
+    d16 = vld1_lane_u16(&y[0].d, d16, 0);
+    d16 = vld1_lane_u16(&y[1].d, d16, 1);
+    d16 = vld1_lane_u16(&y[2].d, d16, 2);
+    d16 = vld1_lane_u16(&y[3].d, d16, 3);
+    const float32x4_t dy = vcvt_f32_f16(vreinterpret_f16_u16(d16));
+
+    return vfmaq_f32(sumv, vmulq_f32(dx, dy), vcvtq_f32_s32(sumi));
+}
+#endif
+
+void ggml_vec_dot_mxfp4_q8_0_mcols(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy, int ny) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    assert(n % QK_MXFP4 == 0);
+    assert(ny >= 1 && ny <= GGML_VEC_DOT_MCOLS);
+    static_assert(QK_MXFP4 == QK8_0, "QK_MXFP4 and QK8_0 must be the same");
+
+    const block_mxfp4 * GGML_RESTRICT x = vx;
+
+    const block_q8_0 * GGML_RESTRICT y0 = vy[0];
+    const block_q8_0 * GGML_RESTRICT y1 = vy[ny > 1 ? 1 : 0];
+    const block_q8_0 * GGML_RESTRICT y2 = vy[ny > 2 ? 2 : 0];
+    const block_q8_0 * GGML_RESTRICT y3 = vy[ny > 3 ? 3 : 0];
+
+    const int nb = n / QK_MXFP4;
+
+    const int8x16_t  values = vld1q_s8(kvalues_mxfp4);
+    const uint8x16_t m4b    = vdupq_n_u8(0x0f);
+
+    float32x4_t sumv0 = vdupq_n_f32(0.0f);
+    float32x4_t sumv1 = vdupq_n_f32(0.0f);
+    float32x4_t sumv2 = vdupq_n_f32(0.0f);
+    float32x4_t sumv3 = vdupq_n_f32(0.0f);
+
+    int ib = 0;
+
+    for (; ib + 3 < nb; ib += 4) {
+        // the nibble unpack is hoisted out of the column loop: this is the work the per-token vec_dot calls repeat
+        int8x16_t wl[4];
+        int8x16_t wh[4];
+
+        for (int k = 0; k < 4; ++k) {
+            const uint8x16_t q = vld1q_u8(x[ib + k].qs);
+            wl[k] = vqtbl1q_s8(values, vandq_u8  (q, m4b));
+            wh[k] = vqtbl1q_s8(values, vshrq_n_u8(q, 4));
+        }
+
+        uint8x16_t e8 = vdupq_n_u8(0);
+        e8 = vld1q_lane_u8(&x[ib + 0].e, e8,  0);
+        e8 = vld1q_lane_u8(&x[ib + 1].e, e8,  4);
+        e8 = vld1q_lane_u8(&x[ib + 2].e, e8,  8);
+        e8 = vld1q_lane_u8(&x[ib + 3].e, e8, 12);
+        const float32x4_t dx = ggml_e8m0x4_to_fp32_half(vreinterpretq_u32_u8(e8));
+
+                    sumv0 = ggml_vec_dot_mxfp4_q8_0_4blk_col(wl, wh, y0 + ib, dx, sumv0);
+        if (ny > 1) sumv1 = ggml_vec_dot_mxfp4_q8_0_4blk_col(wl, wh, y1 + ib, dx, sumv1);
+        if (ny > 2) sumv2 = ggml_vec_dot_mxfp4_q8_0_4blk_col(wl, wh, y2 + ib, dx, sumv2);
+        if (ny > 3) sumv3 = ggml_vec_dot_mxfp4_q8_0_4blk_col(wl, wh, y3 + ib, dx, sumv3);
+    }
+
+    float sumf[GGML_VEC_DOT_MCOLS] = { vaddvq_f32(sumv0), vaddvq_f32(sumv1), vaddvq_f32(sumv2), vaddvq_f32(sumv3) };
+
+    for (; ib < nb; ++ib) {
+        const float dxs = GGML_E8M0_TO_FP32_HALF(x[ib].e);
+        for (int j = 0; j < ny; ++j) {
+            const block_q8_0 * GGML_RESTRICT yj = (const block_q8_0 *) vy[j] + ib;
+            int sumi1 = 0;
+            int sumi2 = 0;
+            for (int k = 0; k < QK_MXFP4/2; ++k) {
+                sumi1 += yj->qs[k +          0] * kvalues_mxfp4[x[ib].qs[k] & 0xf];
+                sumi2 += yj->qs[k + QK_MXFP4/2] * kvalues_mxfp4[x[ib].qs[k] >>  4];
+            }
+            sumf[j] += dxs * GGML_CPU_FP16_TO_FP32(yj->d) * (sumi1 + sumi2);
+        }
+    }
+
+    for (int j = 0; j < ny; ++j) {
+        s[j] = sumf[j];
+    }
+#else
+    ggml_vec_dot_mxfp4_q8_0_mcols_generic(n, s, vx, vy, ny);
+#endif
 }
 
 void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

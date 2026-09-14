@@ -326,6 +326,13 @@ void ggml_vec_dot_mxfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+void ggml_vec_dot_mxfp4_q8_0_mcols_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy, int ny) {
+    // reference: the same result as one vec_dot per column
+    for (int j = 0; j < ny; ++j) {
+        ggml_vec_dot_mxfp4_q8_0(n, s + j, 0, vx, 0, vy[j], 0, 1);
+    }
+}
+
 // NVFP4: super-block of 64 elements = 4 sub-blocks of 16 = 2 q8_0 blocks
 void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
