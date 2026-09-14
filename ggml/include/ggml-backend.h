@@ -330,6 +330,10 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
+    // Number of split-input data copies performed by the last graph compute. Several split inputs can share one copy
+    // tensor (identical views of the same source), in which case the bytes are only copied once per graph compute.
+    GGML_API int                  ggml_backend_sched_get_n_input_copies(ggml_backend_sched_t sched);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
