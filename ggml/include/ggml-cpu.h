@@ -114,11 +114,19 @@ extern "C" {
     typedef void (*ggml_vec_dot_t)  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT x, size_t bx,
                                        const void * GGML_RESTRICT y, size_t by, int nrc);
 
+    // one src0 row against up to GGML_VEC_DOT_MCOLS columns of src1 gathered by pointer, writing ny results to s.
+    // mul_mat_id uses it to unpack a quantized weight block once for several tokens instead of once per token.
+    #define GGML_VEC_DOT_MCOLS 4
+
+    typedef void (*ggml_vec_dot_mcols_t)(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT x,
+                                         const void * const * GGML_RESTRICT y, int ny);
+
     struct ggml_type_traits_cpu {
         ggml_from_float_t        from_float;
         ggml_vec_dot_t           vec_dot;
         enum ggml_type           vec_dot_type;
         int64_t                  nrows; // number of rows to process simultaneously
+        ggml_vec_dot_mcols_t     vec_dot_mcols; // optional, may be NULL
     };
 
     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);
