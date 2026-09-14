@@ -8,7 +8,11 @@ reference oracle's (route<il>_topk from run_oracle_routing.py), per layer:
     (how near a tie the swapped pair was, in the oracle's own scores)
   - if ffn_moe_probs_biased-<il> is dumped: numeric error of our selection scores vs the oracle's
 """
+<<<<<<< HEAD
 import argparse, json, os, sys
+=======
+import argparse, json, os, re, sys
+>>>>>>> v41-dump-logits
 import numpy as np
 
 ap = argparse.ArgumentParser()
@@ -33,7 +37,11 @@ def load(name, dtype):
     arr = np.fromfile(os.path.join(a.dump_dir, e["file"]), dtype=dtype)
     return arr.reshape([n for n in reversed(e["ne"]) if n != 1] or [1])
 
+<<<<<<< HEAD
 layers = sorted(int(k[len("route"):-len("_topk")]) for k in z.files if k.startswith("route") and k.endswith("_topk"))
+=======
+layers = sorted(int(mo.group(1)) for mo in (re.fullmatch(r"route(\d+)_topk", k) for k in z.files) if mo)
+>>>>>>> v41-dump-logits
 q = lambda v, p: np.percentile(v, p) if len(v) else float("nan")
 rows = []; save = {}
 all_gap_flip = []; all_gap = []; all_margin = []
