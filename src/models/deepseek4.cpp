@@ -1920,6 +1920,21 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_engram(
     const int64_t ncol = hashes->ne[0];                 // (max_ngram_size-1)*n_heads = 24
     GGML_ASSERT(x->ne[0] == n_embd && x->ne[1] == hc && hashes->ne[1] == nt);
 
+    // The per-stream views of x taken below are strided: ne = [n_embd, nt] with nb1 = x->nb[2], one n_embd row per
+    // hc*n_embd token stride. ggml_nbytes of such a view spans from its offset to the end of its last row, i.e. very
+    // nearly the whole tensor, and that is what ggml_backend_sched copies for a split input. When x is produced on
+    // another device the hc views therefore each drag almost the entire residual across the link: measured on the
+    // RPC0 (GB10) -> CUDA0 boundary, 4 x 79 MiB per 1024-token ubatch of an 80 MiB tensor, ~316 KiB/token where
+    // 80 KiB/token is needed.
+    //
+    // Take one contiguous copy of the residual at the device boundary and pin it to this layer's own device (see
+    // llama_context::graph_get_cb, "engram_inp"): the boundary then carries the base once, contiguously, and all hc
+    // stream views are local to the consumer. ggml_cont is a plain copy - same values, same order, bit-exact.
+    if (il > 0 && model.dev_layer(il) != model.dev_layer(il - 1)) {
+        x = ggml_cont(ctx0, x);
+        cb(x, "engram_inp", il);
+    }
+
     // gather the n-gram rows, then one wkv projection over their concatenation -> key per copy + value
     ggml_tensor * ids  = ggml_reshape_1d(ctx0, hashes, ncol*nt);
     ggml_tensor * rows = ggml_get_rows(ctx0, layer.engram_embd, ids);           // [ehd, ncol*nt]

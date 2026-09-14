@@ -2543,6 +2543,21 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
 
+        // - the contiguous copy of an engram layer's input (src/models/deepseek4.cpp, build_engram) must run on the
+        //   layer's own device, not on the device that produced the residual: that is the whole point of it. The
+        //   scheduler would otherwise place it with its source, leaving the strided per-stream views to cross the
+        //   boundary one nearly-whole-tensor copy each. No n_tokens guard here - prefill is where this costs most.
+        if (il >= 0 && strcmp(name, "engram_inp") == 0) {
+            const auto & dev_layer = model.dev_layer(il);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                    if (ggml_backend_supports_op(backend.get(), cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    }
+                }
+            }
+        }
+
         // - keep the MoE expert weighting and the reduction over the used experts on the backend that holds the
         //   routed expert weights
         //
