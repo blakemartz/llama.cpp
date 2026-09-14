@@ -308,6 +308,12 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+# scheduler deduplication of identical views crossing a device boundary (ggml only, self-contained)
+add_executable(test-backend-sched-views test-backend-sched-views.cpp)
+target_link_libraries(test-backend-sched-views PRIVATE ggml)
+add_test(NAME test-backend-sched-views COMMAND $<TARGET_FILE:test-backend-sched-views>)
+set_property(TEST test-backend-sched-views PROPERTY LABELS main)
+
 # scheduler placement of ops offloaded from host-resident weights (ggml only, skips without CUDA)
 add_executable(test-backend-sched-offload test-backend-sched-offload.cpp)
 target_link_libraries(test-backend-sched-offload PRIVATE ggml)
