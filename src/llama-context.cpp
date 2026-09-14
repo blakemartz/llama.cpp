@@ -2542,6 +2542,50 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 }
             }
         }
+
+        // - keep the MoE expert weighting and the reduction over the used experts on the backend that holds the
+        //   routed expert weights
+        //
+        // When the routed experts are kept in a host buffer (-ot "blk\.[0-9]+\.ffn_.*_exps=CPU"), the mul_mat_id ops
+        // run on the CPU backend, but the scheduler's backend-expansion passes hand every op that has no weight of
+        // its own to the higher priority (GPU) backend. The CPU split therefore ends at ffn_moe_down and returns
+        // [n_embd, n_expert_used, n_tokens] to the GPU, where the router probabilities are applied and the experts
+        // summed - n_expert_used times the traffic of the [n_embd, n_tokens] result it could return instead
+        // (DeepSeek-V4.1-Flash: 120 KiB/token/layer over 22 CPU layers, against 20 KiB).
+        //
+        // Pinning ffn_moe_out is enough: the scheduler's "expand rest down" pass then carries the CPU assignment
+        // from ffn_moe_down through the weighting and the unnamed partial sums up to it. The only thing that has to
+        // travel the other way is the [1, n_expert_used, n_tokens] weights vector.
+        //
+        // Deliberately NOT pinned: the shared-expert add ("ffn_out"), whose other source comes from
+        // ffn_{up,gate,down}_shexp. Those weights stay on the GPU, so pinning that add would drag them to the CPU.
+        //
+        // Only done with op offloading off: with it on, a large batch copies the expert weights to the GPU and there
+        // is no CPU split left to keep this in. LLAMA_MOE_SUM_ON_EXPERTS=0 disables it entirely.
+        {
+            static const bool moe_sum_on_experts = []() {
+                const char * env = getenv("LLAMA_MOE_SUM_ON_EXPERTS");
+                return env == nullptr || atoi(env) != 0;
+            }();
+
+            if (moe_sum_on_experts && backend_cpu && !cparams.op_offload &&
+                    il >= 0 && (size_t) il < model.layers.size() && strcmp(name, "ffn_moe_out") == 0) {
+                const ggml_tensor * down_exps = model.layers[il].ffn_down_exps;
+
+                if (down_exps != nullptr && down_exps->buffer != nullptr) {
+                    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(down_exps->buffer);
+                    ggml_backend_dev_t dev_layer = model.dev_layer(il);
+
+                    // the experts are in host memory that the layer's own device cannot use in place, i.e. the
+                    // mul_mat_id ops are on the CPU backend - so the weighting and the sum belong there too
+                    if (ggml_backend_buft_is_host(buft) &&
+                            (dev_layer == nullptr || !ggml_backend_dev_supports_buft(dev_layer, buft)) &&
+                            ggml_backend_supports_op(backend_cpu, cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+                    }
+                }
+            }
+        }
     };
 }
 
