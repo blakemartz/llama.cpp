@@ -917,6 +917,46 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+// returns the id of the device backend that holds (or will hold) a non-weight tensor, or -1 if unknown
+//
+// pass 1 of ggml_backend_sched_split_graph visits the nodes in topological order, so when it reaches an op all of
+// its producers have already been visited. however, only pre-allocated tensors, graph inputs and ops that use a
+// weight get a backend in pass 1; plain intermediates (activations, views, activation functions, ...) stay
+// unassigned until pass 2 expands the backends of their neighbours over them. to find out where such an
+// intermediate lives, look through it to the nearest ancestor that already has a backend, skipping weights.
+// the CPU backend (last backend) is not a useful answer here: pass 2 never expands it over GPU ops.
+static int ggml_backend_sched_backend_id_from_src(ggml_backend_sched_t sched, struct ggml_tensor * src, const struct ggml_tensor * op, int depth) {
+    if (src == NULL) {
+        return -1;
+    }
+    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return -1;
+    }
+
+    int src_backend_id = tensor_backend_id(src);
+    if (src_backend_id == -1 && (src->buffer != NULL || (src->view_src != NULL && src->view_src->buffer != NULL))) {
+        // pre-allocated (e.g. a view of the KV cache) but not visited yet
+        src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, op);
+    }
+    if (src_backend_id != -1) {
+        return src_backend_id != sched->n_backends - 1 ? src_backend_id : -1;
+    }
+
+    if (depth <= 0) {
+        return -1;
+    }
+
+    // not assigned yet: it is an intermediate result, look at what produced it (view_src is always among the srcs)
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        src_backend_id = ggml_backend_sched_backend_id_from_src(sched, src->src[i], op, depth - 1);
+        if (src_backend_id != -1) {
+            return src_backend_id;
+        }
+    }
+
+    return -1;
+}
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -968,6 +1008,23 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    // first try the device that already holds the other (non-weight) inputs of the op, typically the
+                    // activations of the layer the weight belongs to. offloading the op there means only the weight has
+                    // to be copied to that device; offloading it to another device would additionally bounce the
+                    // activations and the result between the two devices, and put the whole weight traffic of all
+                    // layers on the first device's link instead of spreading it over the devices that own the layers.
+                    // with a single device this is the same backend that the in-order scan below would pick.
+                    // intermediates that are not assigned yet are looked through (see ggml_backend_sched_backend_id_from_src);
+                    // if nothing can be determined, fall back to the in-order scan.
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        // depth 6 covers the usual activation -> (bias, clamp, activation function, view) -> mul_mat chains
+                        const int b = ggml_backend_sched_backend_id_from_src(sched, tensor->src[j], tensor, 6);
+                        if (b != -1 && b < src_backend_id &&
+                            ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                            SET_CAUSE(tensor, "1.offsrc");
+                            return b;
+                        }
+                    }
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");

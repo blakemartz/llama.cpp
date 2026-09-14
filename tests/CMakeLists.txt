@@ -308,6 +308,12 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+# scheduler placement of ops offloaded from host-resident weights (ggml only, skips without CUDA)
+add_executable(test-backend-sched-offload test-backend-sched-offload.cpp)
+target_link_libraries(test-backend-sched-offload PRIVATE ggml)
+add_test(NAME test-backend-sched-offload COMMAND $<TARGET_FILE:test-backend-sched-offload>)
+set_property(TEST test-backend-sched-offload PROPERTY LABELS main)
+
 # the tensor API kernels come from a separate metallib - check they produce correct results
 # ref: https://github.com/ggml-org/llama.cpp/issues/27473
 if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)
