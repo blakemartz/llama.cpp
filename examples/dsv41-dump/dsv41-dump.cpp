@@ -54,6 +54,8 @@ static bool dsv41_dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         case GGML_TYPE_F32:  std::memcpy(f32.data(), raw.data(), n*sizeof(float)); break;
         case GGML_TYPE_F16:  for (int64_t i = 0; i < n; ++i) f32[i] = ggml_fp16_to_fp32(((const ggml_fp16_t *) raw.data())[i]); break;
         case GGML_TYPE_BF16: for (int64_t i = 0; i < n; ++i) f32[i] = ggml_bf16_to_fp32(((const ggml_bf16_t *) raw.data())[i]); break;
+        // index tensors (ggml_top_k output); exact as f32 below 2^24, which any cache index is
+        case GGML_TYPE_I32:  for (int64_t i = 0; i < n; ++i) f32[i] = (float) ((const int32_t *) raw.data())[i]; break;
         default:
             LOG_WRN("dsv41-dump: %s has type %s -- not dumped\n", t->name, ggml_type_name(t->type));
             st->n_skipped++;

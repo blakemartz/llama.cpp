@@ -2044,24 +2044,43 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_indexer_top_k_v41(
             idx_w->ne[0], idx_w->ne[1]/n_stream, idx_w->ne[2], n_stream,
             idx_w->nb[1], idx_w->nb[2]/n_stream, idx_w->nb[3]/n_stream, 0);
 
-    idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
-    idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
+    // The fused lightning indexer (the same op the DSV4 build_lid_top_k uses) computes
+    // relu(q.k) * w summed over heads, plus the mask, without ever materialising the
+    // [n_comp, nt, n_head] f32 intermediates of the unfused chain below -- those are what made
+    // the compute reserve scale as context x ubatch. DSV41_UNFUSED_LID=1 forces the unfused
+    // chain so the two can be A/B'd inside one build.
+    static const bool unfused_lid = getenv("DSV41_UNFUSED_LID") != nullptr;
 
-    ggml_tensor * score = ggml_mul_mat(ctx0, idx_k, idx_q);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+    ggml_tensor * score = nullptr;
+    if (cparams.fused_lid && !unfused_lid) {
+        // the op needs an f16 mask; the V4.1 compressed mask is f16 only under flash attention.
+        // It holds nothing but 0 and -inf, so narrowing it is exact.
+        if (mask->type != GGML_TYPE_F16) {
+            mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        }
+        score = ggml_lightning_indexer(ctx0, idx_q, idx_k, idx_w, mask);
+        cb(score, "csa2_idx_score", il);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+    } else {
+        idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
+        idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
 
-    score = ggml_relu(ctx0, score);
-    score = ggml_mul(ctx0, score, idx_w);
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+        score = ggml_mul_mat(ctx0, idx_k, idx_q);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
 
-    // the mask is F16 under flash attention and the score is F32; the mask only ever holds 0 or -inf,
-    // so widening it is exact.
-    if (mask->type != score->type) {
-        mask = ggml_cast(ctx0, mask, score->type);
+        score = ggml_relu(ctx0, score);
+        score = ggml_mul(ctx0, score, idx_w);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+        // the mask is F16 under flash attention and the score is F32; the mask only ever holds 0 or -inf,
+        // so widening it is exact.
+        if (mask->type != score->type) {
+            mask = ggml_cast(ctx0, mask, score->type);
+        }
+        score = ggml_add(ctx0, score, mask);
+        cb(score, "csa2_idx_score", il);
     }
-    score = ggml_add(ctx0, score, mask);
-    cb(score, "csa2_idx_score", il);
 
     const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
