@@ -853,42 +853,69 @@ static struct ggml_tensor * ggml_backend_sched_view_base(struct ggml_tensor * t)
     return t->view_src ? t->view_src : t;
 }
 
-// true if `a` and `b` are interchangeable as the source of a split-input copy: both are pure views (they compute
-// nothing themselves) addressing exactly the same bytes of the same tensor with the same layout.
+static const struct ggml_tensor * ggml_backend_sched_view_base(const struct ggml_tensor * t) {
+    return t->view_src ? t->view_src : t;
+}
+
+// a tensor stands for its own bytes at the time it is read: either it is not a view, or it is a pure view op (which
+// computes nothing). An op that writes through a view of its destination (set_rows, cpy, the in-place ops) does not
+// qualify - what it holds depends on when it is read. User inputs never qualify: the application may rewrite them.
+static bool ggml_backend_sched_reads_as_is(const struct ggml_tensor * a) {
+    if (a->flags & GGML_TENSOR_FLAG_INPUT) {
+        return false;
+    }
+    return a->view_src == NULL || ggml_is_view_op(a->op);
+}
+
+// how the bytes of two candidate split inputs relate
+enum ggml_backend_sched_bytes {
+    GGML_SCHED_BYTES_NO      = 0, // unrelated, or not safely comparable
+    GGML_SCHED_BYTES_SAME    = 1, // the same bytes in the same layout: one copy tensor can serve both
+    GGML_SCHED_BYTES_RESHAPE = 2, // the same bytes, both contiguous, different shape: one can alias the other's copy
+};
+
+// classify `a` and `b` as sources of a split-input copy.
 //
-// several consumers commonly build their own, separately created, identical view of one shared tensor - for example
-// one get_k() view of a shared KV cache per attending layer. Those are distinct ggml_tensors, so without this the
-// scheduler creates one copy tensor per consuming split and copies the same bytes once per split.
+// GGML_SCHED_BYTES_SAME covers the common case of several consumers separately building an identical view of one
+// shared tensor - one get_k() view of a shared KV cache per attending layer, say. Those are distinct ggml_tensors, so
+// without this the scheduler makes one copy tensor per consuming split and moves the same bytes once per split.
 //
-// note: an op that writes through a view of its destination (set_rows, cpy, the in-place ops) is deliberately
-// excluded - what such a tensor holds depends on when it is read, so two of them are not interchangeable.
-static bool ggml_backend_sched_same_view(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+// GGML_SCHED_BYTES_RESHAPE covers a tensor and a reshape of it (or two reshapes of one tensor) both crossing into the
+// same backend: the same bytes with a different shape, which cannot share a copy tensor outright without handing the
+// consumer the wrong shape, but can share its memory.
+static enum ggml_backend_sched_bytes ggml_backend_sched_same_bytes(
+        const struct ggml_tensor * a, const struct ggml_tensor * b) {
     if (a == b) {
-        return true;
+        return GGML_SCHED_BYTES_SAME;
     }
-    if (a->view_src == NULL || a->view_src != b->view_src) {
-        return false;
+    if (a->type != b->type) {
+        return GGML_SCHED_BYTES_NO;
     }
-    if (!ggml_is_view_op(a->op) || !ggml_is_view_op(b->op)) {
-        return false;
+    if (!ggml_backend_sched_reads_as_is(a) || !ggml_backend_sched_reads_as_is(b)) {
+        return GGML_SCHED_BYTES_NO;
     }
-    if (a->view_offs != b->view_offs || a->type != b->type || a->buffer != b->buffer || a->data != b->data) {
-        return false;
+    // same first byte of the same underlying tensor (view_offs is absolute, see ggml_new_tensor_impl)
+    if (ggml_backend_sched_view_base(a) != ggml_backend_sched_view_base(b)) {
+        return GGML_SCHED_BYTES_NO;
     }
-    if ((a->flags & GGML_TENSOR_FLAG_INPUT) || (b->flags & GGML_TENSOR_FLAG_INPUT)) {
-        return false; // user inputs may be written between computes, never share their copies
+    if (a->view_offs != b->view_offs || a->data != b->data || a->buffer != b->buffer) {
+        return GGML_SCHED_BYTES_NO;
     }
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        if (a->ne[i] != b->ne[i] || a->nb[i] != b->nb[i]) {
-            return false;
-        }
+
+    bool same_layout = true;
+    for (int i = 0; i < GGML_MAX_DIMS && same_layout; i++) {
+        same_layout = a->ne[i] == b->ne[i] && a->nb[i] == b->nb[i];
     }
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (a->src[i] != b->src[i]) {
-            return false;
-        }
+    if (same_layout) {
+        return GGML_SCHED_BYTES_SAME;
     }
-    return true;
+
+    // different shape over the same first byte: only the same bytes if both are packed and hold as many elements
+    if (ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_nelements(a) == ggml_nelements(b)) {
+        return GGML_SCHED_BYTES_RESHAPE;
+    }
+
+    return GGML_SCHED_BYTES_NO;
 }
 
 // an input copy that has already been filled during the current graph compute, and the source it was filled from
@@ -1445,8 +1472,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // pass 5: split graph, find tensors that need to be copied
     {
-        // split inputs that are views, with the backend they were copied into, so that a later split needing an
-        // identical view can reuse that copy tensor instead of creating a second one [ggml_backend_sched_same_view]
+        // split inputs already copied, with the backend they were copied into, so that a later split needing the same
+        // source with the same bytes can reuse that copy instead of moving them again [ggml_backend_sched_same_bytes]
         std::vector<std::pair<int, struct ggml_tensor *>> view_inputs;
         // the copy tensors that ended up shared by more than one source tensor
         std::vector<struct ggml_tensor *> shared_copies;
@@ -1557,28 +1584,51 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         need_input = true;
 
-                        // if an identical view was already copied into this backend in this graph, point this source
-                        // at that same copy tensor instead of making a second one
+                        // if the same bytes were already copied into this backend in this graph, reuse that copy
+                        // instead of moving them again
                         struct ggml_tensor * dup = NULL;
-                        if (src->view_src != NULL) {
-                            for (const auto & vi : view_inputs) {
-                                if (vi.first == cur_backend_id && ggml_backend_sched_same_view(vi.second, src)) {
-                                    dup = vi.second;
-                                    break;
-                                }
+                        enum ggml_backend_sched_bytes rel = GGML_SCHED_BYTES_NO;
+                        for (const auto & vi : view_inputs) {
+                            if (vi.first != cur_backend_id) {
+                                continue;
+                            }
+                            rel = ggml_backend_sched_same_bytes(vi.second, src);
+                            if (rel != GGML_SCHED_BYTES_NO) {
+                                dup = vi.second;
+                                break;
+                            }
+                        }
+
+                        if (dup != NULL && rel == GGML_SCHED_BYTES_RESHAPE) {
+                            // the shapes differ, so the consumer cannot be handed the existing copy tensor: give this
+                            // source its own tensor with its own shape, viewing that copy's memory. Not done under
+                            // pipeline parallelism, where the copies carry INPUT/OUTPUT flags of their own.
+                            const size_t dup_id = hash_id(dup);
+                            if (sched->n_copies != 1 ||
+                                    !ggml_is_contiguous(tensor_id_copy(dup_id, cur_backend_id, 0))) {
+                                dup = NULL;
                             }
                         }
 
                         if (dup != NULL) {
+                            ggml_backend_t backend = sched->backends[cur_backend_id];
                             const size_t dup_id = hash_id(dup);
                             for (int c = 0; c < sched->n_copies; c++) {
-                                tensor_id_copy(src_id, cur_backend_id, c) = tensor_id_copy(dup_id, cur_backend_id, c);
+                                struct ggml_tensor * dup_cpy = tensor_id_copy(dup_id, cur_backend_id, c);
+                                struct ggml_tensor * cpy = dup_cpy;
+                                if (rel == GGML_SCHED_BYTES_RESHAPE) {
+                                    cpy = ggml_reshape_4d(sched->ctx, dup_cpy,
+                                            src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+                                    ggml_format_name(cpy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                                }
+                                tensor_id_copy(src_id, cur_backend_id, c) = cpy;
                             }
-                            SET_CAUSE(src, "4.vdup");
+                            SET_CAUSE(src, rel == GGML_SCHED_BYTES_RESHAPE ? "4.vrsh" : "4.vdup");
 
-                            struct ggml_tensor * cpy = tensor_id_copy(src_id, cur_backend_id, 0);
-                            if (std::find(shared_copies.begin(), shared_copies.end(), cpy) == shared_copies.end()) {
-                                shared_copies.push_back(cpy);
+                            struct ggml_tensor * base_cpy = ggml_backend_sched_view_base(
+                                    tensor_id_copy(src_id, cur_backend_id, 0));
+                            if (std::find(shared_copies.begin(), shared_copies.end(), base_cpy) == shared_copies.end()) {
+                                shared_copies.push_back(base_cpy);
                             }
                         } else {
                             ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1592,12 +1642,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                                 SET_CAUSE(tensor_copy, "4.cpy");
                             }
-                            if (src->view_src != NULL) {
-                                view_inputs.push_back({ cur_backend_id, src });
-                            }
+                            view_inputs.push_back({ cur_backend_id, src });
                         }
                     } else if (std::find(shared_copies.begin(), shared_copies.end(),
-                                tensor_id_copy(src_id, cur_backend_id, 0)) != shared_copies.end()) {
+                                ggml_backend_sched_view_base(tensor_id_copy(src_id, cur_backend_id, 0)))
+                            != shared_copies.end()) {
                         // this copy tensor is shared by several sources, so it may hold another one's bytes by now:
                         // list this source again so that compute_splits can refresh it. The refresh is skipped there
                         // when the copy already holds these bytes and nothing has written to them since.
@@ -1859,7 +1908,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // input copies already made during this graph compute. This function runs exactly once per
     // ggml_backend_sched_graph_compute(_async), so a local is the per-graph-compute reset.
     // split_graph can point several split inputs at one copy tensor when they are identical views of the same source
-    // [ggml_backend_sched_same_view]; the bytes then only need to be copied the first time, unless something computed
+    // [ggml_backend_sched_same_bytes]; the bytes then only need to be copied the first time, unless something computed
     // in between wrote to them [ggml_backend_sched_invalidate_copies].
     std::vector<ggml_backend_sched_copied_input> copied;
 
@@ -1898,8 +1947,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // written to them - this is what turns the deduplicated views into a single copy per graph compute
             {
                 bool already_copied = false;
+                struct ggml_tensor * cpy_base = ggml_backend_sched_view_base(input_cpy);
                 for (const auto & ci : copied) {
-                    if (ci.dst == input_cpy && (ci.src == input || ggml_backend_sched_same_view(ci.src, input))) {
+                    if (ggml_backend_sched_view_base(ci.dst) == cpy_base &&
+                            ggml_backend_sched_same_bytes(ci.src, input) != GGML_SCHED_BYTES_NO) {
                         already_copied = true;
                         break;
                     }

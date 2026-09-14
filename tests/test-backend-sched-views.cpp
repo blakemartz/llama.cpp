@@ -226,6 +226,7 @@ enum case_kind {
     CASE_SAME_VIEWS,  // K consumers, all reading the same view of the shared tensor
     CASE_DISJOINT,    // K consumers, each reading a different column of it (control: no deduplication possible)
     CASE_MODIFIED,    // two consumers of the same view, with an in-place write to the base in between
+    CASE_RESHAPE,     // two consumers of the same bytes through differently shaped contiguous views
 };
 
 // builds and runs one case. `far` holds the weights of the ops that must run away from the dummy device (in a plain
@@ -260,11 +261,13 @@ static std::vector<float> run_case(case_kind kind, dummy_dev * dev, ggml_backend
     for (int k = 0; k < K; k++) {
         w_far[k] = ggml_new_tensor_2d(ctx_far, GGML_TYPE_F32, NE, NE);
     }
+    ggml_tensor * w_wide = ggml_new_tensor_2d(ctx_far, GGML_TYPE_F32, 2*NE, 2*NE);
     ggml_backend_buffer_t buf_far = ggml_backend_alloc_ctx_tensors(ctx_far, cpu);
     ggml_backend_buffer_set_usage(buf_far, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     for (int k = 0; k < K; k++) {
         fill_f32(w_far[k], 100 + k);
     }
+    fill_f32(w_wide, 200);
 
     ggml_init_params gp = { ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(256, false), nullptr, true };
     ggml_context * ctx_g = ggml_init(gp);
@@ -276,7 +279,24 @@ static std::vector<float> run_case(case_kind kind, dummy_dev * dev, ggml_backend
 
     ggml_tensor * out = nullptr;
 
-    if (kind == CASE_MODIFIED) {
+    if (kind == CASE_RESHAPE) {
+        // the production shape: a reshape of the tensor crosses first, then the tensor itself. The consumers need
+        // different shapes, so the second copy tensor has to alias the first's memory rather than replace it.
+        ggml_tensor * r  = ggml_reshape_2d(ctx_g, shared, 2*NE, NC/2);
+        ggml_tensor * c1 = ggml_mul_mat(ctx_g, w_wide, r);                 // [2*NE, NC/2]
+        ggml_build_forward_expand(gf, c1);
+
+        ggml_tensor * b1 = ggml_mul_mat(ctx_g, w_near[0], ggml_reshape_2d(ctx_g, c1, NE, NC));
+        ggml_build_forward_expand(gf, b1);
+
+        ggml_tensor * c2 = ggml_mul_mat(ctx_g, w_far[0], shared);          // [NE, NC], same bytes as r
+        ggml_build_forward_expand(gf, c2);
+
+        ggml_tensor * b2 = ggml_mul_mat(ctx_g, w_near[1], c2);
+        ggml_build_forward_expand(gf, b2);
+
+        out = ggml_add(ctx_g, b1, b2);
+    } else if (kind == CASE_MODIFIED) {
         // consumer 1 reads the whole tensor ...
         ggml_tensor * v1 = ggml_view_2d(ctx_g, shared, NE, NC, shared->nb[1], 0);
         ggml_tensor * c1 = ggml_mul_mat(ctx_g, w_far[0], v1);
@@ -362,6 +382,8 @@ int main() {
         { CASE_DISJOINT,   "disjoint sub-views x K",     K },
         // the base is written between the two consumers of an identical view: the copy must be redone
         { CASE_MODIFIED,   "same view, base modified",   2 },
+        // a reshape of the tensor and the tensor itself: the same bytes in two shapes, moved once
+        { CASE_RESHAPE,    "tensor + reshape of it",     1 },
     };
 
     int n_fail = 0;
