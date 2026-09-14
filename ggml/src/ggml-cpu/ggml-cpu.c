@@ -289,6 +289,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot                  = ggml_vec_dot_mxfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
+        .vec_dot_mcols            = ggml_vec_dot_mxfp4_q8_0_mcols,
     },
     [GGML_TYPE_NVFP4] = {
         .from_float               = quantize_row_nvfp4,
@@ -1490,7 +1491,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
-    const void * wdata) {
+    const void * wdata,
+    ggml_vec_dot_mcols_t vec_dot_mcols) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1498,6 +1500,44 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+    if (vec_dot_mcols && ir1_end - ir1_start > 1) {
+        // several rows of this expert at once: each weight row is then read and dequantized once for all of them,
+        // instead of once per row as the vec_dot loop below does
+        const void * cols[GGML_VEC_DOT_MCOLS];
+        float *      dsts[GGML_VEC_DOT_MCOLS];
+
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += GGML_VEC_DOT_MCOLS) {
+            const int ny = (int) MIN((int64_t) GGML_VEC_DOT_MCOLS, ir1_end - iir1);
+
+            for (int j = 0; j < ny; ++j) {
+                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, iir1 + j);
+
+                const int      id  = row_mapping.i1; // selected expert index
+                const int64_t  i11 = id % ne11;
+                const int64_t  i12 = row_mapping.i2; // row index in src1
+
+                cols[j] = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                    ? (i11      + i12*ne11)*row_size
+                    : (i11*nb11 + i12*nb12));
+
+                dsts[j] = (float *) ((char *) dst->data + (id*nb1 + i12*nb2));
+            }
+
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                float res[GGML_VEC_DOT_MCOLS];
+
+                vec_dot_mcols(ne00, res, src0_cur + ir0*nb01, cols, ny);
+
+                for (int j = 0; j < ny; ++j) {
+                    dsts[j][ir0] = res[j];
+                }
+            }
+        }
+
+        return;
+    }
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1566,6 +1606,10 @@ static void ggml_compute_forward_mul_mat_id(
 
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
+
+    // multi-column vec_dot, when the type has one: several rows of the same expert share one read and one dequant
+    // of each weight row (use_ref keeps the plain one-vec_dot-per-row path)
+    ggml_vec_dot_mcols_t const vec_dot_mcols = params->use_ref ? NULL : type_traits_cpu[type].vec_dot_mcols;
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -1727,7 +1771,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, vec_dot_mcols
             );
 
             if (nth >= nchunk0 * nchunk1) {
