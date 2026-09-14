@@ -297,6 +297,15 @@ static const char * cu_get_error_str(CUresult err) {
 #    define BLACKWELL_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
 
+// The native FP4 MMQ path uses the Blackwell FP4 tensor cores, which requires quantizing the
+// activations to 4-bit e2m1 blocks. Compiling with GGML_CUDA_NO_NATIVE_FP4 disables that path so that
+// MXFP4/NVFP4 keep the 8-bit (q8_1) activations used by all other architectures.
+// This macro is the compile-time/device-side counterpart of ggml_cuda_native_fp4_enabled(cc);
+// both are derived from GGML_CUDA_NO_NATIVE_FP4 so host and device can never disagree.
+#if defined(BLACKWELL_MMA_AVAILABLE) && !defined(GGML_CUDA_NO_NATIVE_FP4)
+#    define NATIVE_FP4_ENABLED
+#endif // defined(BLACKWELL_MMA_AVAILABLE) && !defined(GGML_CUDA_NO_NATIVE_FP4)
+
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -370,6 +379,17 @@ static bool cp_async_available(const int cc) {
 static bool blackwell_mma_available(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
+}
+
+// Host-side counterpart of NATIVE_FP4_ENABLED: whether MXFP4/NVFP4 matrix multiplications quantize
+// the activations to 4-bit e2m1 blocks (native FP4 tensor cores) instead of q8_1.
+static bool ggml_cuda_native_fp4_enabled(const int cc) {
+#ifdef GGML_CUDA_NO_NATIVE_FP4
+    GGML_UNUSED(cc);
+    return false;
+#else
+    return blackwell_mma_available(cc);
+#endif // GGML_CUDA_NO_NATIVE_FP4
 }
 
 // Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.

@@ -637,6 +637,10 @@ void quantize_scatter_mmq_fp4_cuda(
         const float * x, const int32_t * ids_src1_inv, void * vy, float * scale, const ggml_type type_src0, const bool use_aligned_float8,
         const int64_t ne00, const int64_t stride_token, const int64_t ne0,
         const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
+#ifdef GGML_CUDA_NO_NATIVE_FP4
+    // The host side must never select the native FP4 path when it is compiled out.
+    GGML_ABORT("native FP4 activations are disabled at compile time (GGML_CUDA_NO_NATIVE_FP4)");
+#endif // GGML_CUDA_NO_NATIVE_FP4
     GGML_ASSERT(ne0 > 0);
     if (type_src0 == GGML_TYPE_NVFP4) {
         GGML_ASSERT(scale);
@@ -666,6 +670,10 @@ void quantize_mmq_fp4_cuda(
         const float * x, const int32_t * ids, void * vy, float * scale, const ggml_type type_src0, const bool use_aligned_float8,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+#ifdef GGML_CUDA_NO_NATIVE_FP4
+    // The host side must never select the native FP4 path when it is compiled out.
+    GGML_ABORT("native FP4 activations are disabled at compile time (GGML_CUDA_NO_NATIVE_FP4)");
+#endif // GGML_CUDA_NO_NATIVE_FP4
     GGML_ASSERT(type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4);
     GGML_ASSERT(ne0 > 0);
 

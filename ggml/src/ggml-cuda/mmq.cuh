@@ -681,7 +681,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
 
 // ---------------------------------------------------------------------------------------------
 
-#ifdef BLACKWELL_MMA_AVAILABLE
+#ifdef NATIVE_FP4_ENABLED
     switch (type) {
         case GGML_TYPE_MXFP4:
             return ggml_cuda_mmq_util_funcs(
@@ -698,7 +698,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
         default:
             break;
     }
-#endif // BLACKWELL_MMA_AVAILABLE
+#endif // NATIVE_FP4_ENABLED
 
 // ---------------------------------------------------------------------------------------------
 
@@ -885,12 +885,12 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     int * tile_y = data_mul_mat_q + J;
     int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
-#if defined(BLACKWELL_MMA_AVAILABLE)
+#if defined(NATIVE_FP4_ENABLED)
     // FP4 tile stores 8 blocks
     constexpr int ne_block = (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) ? QK_FP4_MMQ : QK8_1_MMQ;
 #else
     constexpr int ne_block = QK8_1_MMQ;
-#endif  // defined(BLACKWELL_MMA_AVAILABLE)
+#endif  // defined(NATIVE_FP4_ENABLED)
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;

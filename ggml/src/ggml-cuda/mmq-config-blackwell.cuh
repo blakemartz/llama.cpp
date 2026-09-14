@@ -1,4 +1,9 @@
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_blackwell(ggml_type type, int J, bool fallback) {
+// The FP4 SRAM layout uses the Blackwell FP4 tensor cores, which need e2m1-quantized activations.
+// With GGML_CUDA_NO_NATIVE_FP4 these entries are omitted so that MXFP4/NVFP4 fall through to the
+// Ampere/Ada configs below, i.e. the q8_1-activation kernels. This function is __host__ __device__,
+// so both compilation passes see the same table.
+#ifndef GGML_CUDA_NO_NATIVE_FP4
     CASE(GGML_TYPE_MXFP4, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, true);
     CASE(GGML_TYPE_MXFP4, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, true);
     CASE(GGML_TYPE_MXFP4, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, true);
@@ -32,6 +37,8 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_NVFP4, 256, 1, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
+
+#endif // GGML_CUDA_NO_NATIVE_FP4
 
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 }

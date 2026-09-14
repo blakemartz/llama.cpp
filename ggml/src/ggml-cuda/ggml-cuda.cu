@@ -269,6 +269,9 @@ static ggml_cuda_device_info ggml_cuda_init() {
         GGML_LOG_INFO("%s: emulating %d virtual device(s) on %d physical device(s) (GGML_CUDA_DEVICES)\n",
                       __func__, info.device_count, info.physical_device_count);
     }
+#ifdef GGML_CUDA_NO_NATIVE_FP4
+    GGML_LOG_INFO("%s: GGML_CUDA_NO_NATIVE_FP4 is set, MXFP4/NVFP4 MMQ uses 8-bit (q8_1) activations\n", __func__);
+#endif // GGML_CUDA_NO_NATIVE_FP4
     total_vram = 0;
 
     std::vector<std::pair<int, std::string>> turing_devices_without_mma;
@@ -5647,7 +5650,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     {
         const auto & info = ggml_cuda_info();
         for (int id = 0; id < info.device_count; ++id) {
-            if (blackwell_mma_available(info.devices[id].cc)) {
+            if (ggml_cuda_native_fp4_enabled(info.devices[id].cc)) {
                 features.push_back({ "BLACKWELL_NATIVE_FP4", "1"});
                 break;
             }
