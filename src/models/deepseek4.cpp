@@ -13,6 +13,12 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <thread>
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     if (ext_factor == 0.0f) {
@@ -1643,6 +1649,130 @@ struct dsv41_engram_consts {
     }
 };
 
+// Engram row prefetch.
+//
+// The engram tables are TENSOR_READ_LAZY: a 194 GiB window of the GGUF mmap carrying
+// POSIX_MADV_RANDOM, so the kernel does no readahead and every row the gather wants that is not
+// already resident becomes a synchronous 4 KiB page fault taken *inside* GET_ROWS, one at a time.
+// Measured on astra (KC3000 NVMe, 2 engram layers x 24 hash columns = 48 lookups/token): a cold
+// 1024-token ubatch spends ~3.8 s at ~10.2k IOPS with aqu-sz ~0.85, rareq-sz 4.00 KiB and
+// r_await ~0.087 ms while the CPU sits at 0.4% -- up to 3.2 ms/token of pure, fully serialised
+// fault latency, ~40% of a cold prefill. The row ids for the entire ubatch are known here, before
+// the graph runs, so fault them in parallel and hand the device a deep queue instead of QD~1.
+// Rows already resident cost a ~10 ns touch, so this stays a no-op on warm content.
+//
+//   DSV41_ENGRAM_PREFETCH          0 = off, 1 = parallel touch (default), 2 = MADV_WILLNEED,
+//                                  3 = MADV_WILLNEED then parallel touch
+//   DSV41_ENGRAM_PREFETCH_THREADS  worker count for the touch modes (default 64)
+//
+// Read-only by construction: it only reads bytes the gather is about to read anyway, so it cannot
+// change any output.
+static int dsv41_engram_prefetch_mode() {
+    static const int mode = [] {
+        const char * e = getenv("DSV41_ENGRAM_PREFETCH");
+        return e ? atoi(e) : 1;
+    }();
+    return mode;
+}
+
+static int dsv41_engram_prefetch_nthread() {
+    static const int n = [] {
+        const char * e = getenv("DSV41_ENGRAM_PREFETCH_THREADS");
+        const int v = e ? atoi(e) : 64;
+        return v < 1 ? 1 : v;
+    }();
+    return n;
+}
+
+static void dsv41_engram_prefetch(const std::vector<const ggml_tensor *>  & embd,
+                                  const std::vector<std::vector<int32_t>> & ids) {
+#if defined(_WIN32)
+    GGML_UNUSED(embd);
+    GGML_UNUSED(ids);
+#else
+    const int mode = dsv41_engram_prefetch_mode();
+    if (mode == 0 || embd.empty()) {
+        return;
+    }
+
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+
+    // The distinct pages the gather will fault. A row is 272 B (256 x Q8_0) so a page holds ~15 of
+    // them; dedup keeps the touch count at the number of real faults rather than 48/token.
+    std::vector<uintptr_t> pages;
+    for (size_t li = 0; li < embd.size() && li < ids.size(); ++li) {
+        const ggml_tensor * t = embd[li];
+        if (!t || !t->data) {
+            continue;                     // not a lazy mmap (fully resident tensor): nothing to do
+        }
+        const size_t  stride = t->nb[1];
+        const size_t  rsz    = ggml_row_size(t->type, t->ne[0]);
+        const int64_t nrow   = t->ne[1];
+
+        pages.reserve(pages.size() + ids[li].size());
+        for (const int32_t id : ids[li]) {
+            if (id < 0 || (int64_t) id >= nrow) {
+                continue;                 // hashes are bounded by construction; stay safe anyway
+            }
+            const uintptr_t a  = (uintptr_t) t->data + (size_t) id * stride;
+            const uintptr_t p0 = a & ~(uintptr_t) (page - 1);
+            const uintptr_t p1 = (a + rsz - 1) & ~(uintptr_t) (page - 1);
+            pages.push_back(p0);
+            if (p1 != p0) {
+                pages.push_back(p1);      // a row straddling a page boundary needs both
+            }
+        }
+    }
+    if (pages.empty()) {
+        return;
+    }
+
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+
+    if (mode == 2 || mode == 3) {
+        // one advice call per run of consecutive pages
+        for (size_t i = 0; i < pages.size(); ) {
+            size_t j = i + 1;
+            while (j < pages.size() && pages[j] == pages[j-1] + page) {
+                ++j;
+            }
+            posix_madvise((void *) pages[i], (pages[j-1] - pages[i]) + page, POSIX_MADV_WILLNEED);
+            i = j;
+        }
+        if (mode == 2) {
+            return;
+        }
+    }
+
+    // Blocking faults, but many at once: the point is queue depth, not per-fault latency.
+    const size_t n_thread = std::min<size_t>((size_t) dsv41_engram_prefetch_nthread(), pages.size());
+    auto touch = [&pages](size_t first, size_t step) {
+        uint8_t s = 0;
+        for (size_t i = first; i < pages.size(); i += step) {
+            s ^= *(const volatile uint8_t *) pages[i];
+        }
+        // keep the loads from being optimised away without writing anything observable
+        asm volatile("" :: "r"(s));
+    };
+
+    if (n_thread <= 1) {
+        touch(0, 1);
+        return;
+    }
+
+    std::vector<std::thread> pool;
+    pool.reserve(n_thread - 1);
+    for (size_t k = 1; k < n_thread; ++k) {
+        pool.emplace_back(touch, k, n_thread);
+    }
+    touch(0, n_thread);
+    for (auto & th : pool) {
+        th.join();
+    }
+#endif
+}
+
 class llm_graph_input_dsv41_engram : public llm_graph_input_i {
 public:
     // A position with no token id (an image span: llama.cpp delivers those as an embedding-only
@@ -1703,6 +1833,7 @@ public:
                 }
             }
         }
+        dsv41_engram_prefetch(embd, buf);
         for (size_t li = 0; li < layer_ids.size(); ++li) {
             ggml_backend_tensor_set(hashes[li], buf[li].data(), 0, buf[li].size() * sizeof(int32_t));
         }
@@ -1732,16 +1863,19 @@ public:
             n_pos_file = n / (layer_ids.size() * (size_t) n_hash_cols);
         }
         const int64_t n_tokens = ubatch->n_tokens;
-        std::vector<int32_t> buf((size_t) n_hash_cols * n_tokens);
+        std::vector<std::vector<int32_t>> buf(layer_ids.size(), std::vector<int32_t>((size_t) n_hash_cols * n_tokens));
         for (size_t li = 0; li < layer_ids.size(); ++li) {
             for (int64_t t = 0; t < n_tokens; ++t) {
                 const size_t pos = (size_t) ubatch->pos[t];
                 GGML_ASSERT(pos < n_pos_file && "DSV41_ENGRAM_HASHES has no row for this position");
                 for (int64_t c = 0; c < n_hash_cols; ++c) {
-                    buf[(size_t) t*n_hash_cols + c] = table[(li*n_pos_file + pos)*(size_t) n_hash_cols + (size_t) c];
+                    buf[li][(size_t) t*n_hash_cols + c] = table[(li*n_pos_file + pos)*(size_t) n_hash_cols + (size_t) c];
                 }
             }
-            ggml_backend_tensor_set(hashes[li], buf.data(), 0, buf.size()*sizeof(int32_t));
+        }
+        dsv41_engram_prefetch(embd, buf);
+        for (size_t li = 0; li < layer_ids.size(); ++li) {
+            ggml_backend_tensor_set(hashes[li], buf[li].data(), 0, buf[li].size()*sizeof(int32_t));
         }
     }
 
@@ -1765,6 +1899,7 @@ public:
     std::vector<int32_t> layer_ids;                 // engram layers in order (index = layer_hash_index)
     int64_t n_hash_cols;
     std::vector<ggml_tensor *> hashes;              // I32 [n_hash_cols, n_tokens] per engram layer
+    std::vector<const ggml_tensor *> embd;          // engram_embd per engram layer, for the row prefetch
     ggml_tensor * text_mask = nullptr;              // F32 [1, n_tokens]: 1 for text, 0 for image spans
     std::vector<int32_t> table;
     size_t n_pos_file = 0;
@@ -2338,6 +2473,7 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
             ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_hash_cols, n_tokens);
             ggml_set_input(t);
             inp->hashes.push_back(t);
+            inp->embd.push_back(model.layers[engram_layers[li]].engram_embd);
         }
         // 1 for text, 0 for an image span: shuts the engram gate so those positions pass through
         inp->text_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
