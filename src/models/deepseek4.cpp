@@ -1664,6 +1664,7 @@ struct dsv41_engram_consts {
 //   DSV41_ENGRAM_PREFETCH          0 = off, 1 = parallel touch (default), 2 = MADV_WILLNEED,
 //                                  3 = MADV_WILLNEED then parallel touch
 //   DSV41_ENGRAM_PREFETCH_THREADS  worker count for the touch modes (default 64)
+//   DSV41_ENGRAM_PREFETCH_SMALL    page sets up to this size use MADV_WILLNEED + serial touch, no threads (512)
 //
 // Read-only by construction: it only reads bytes the gather is about to read anyway, so it cannot
 // change any output.
@@ -1673,6 +1674,15 @@ static int dsv41_engram_prefetch_mode() {
         return e ? atoi(e) : 1;
     }();
     return mode;
+}
+
+// below this many distinct pages the prefetch uses MADV_WILLNEED + a serial touch instead of a thread pool
+static size_t dsv41_engram_prefetch_small() {
+    static const size_t n = [] {
+        const char * e = getenv("DSV41_ENGRAM_PREFETCH_SMALL");
+        return (size_t) (e ? atoi(e) : 512);
+    }();
+    return n;
 }
 
 static int dsv41_engram_prefetch_nthread() {
@@ -1743,6 +1753,28 @@ static void dsv41_engram_prefetch(const std::vector<const ggml_tensor *>  & embd
         if (mode == 2) {
             return;
         }
+    }
+
+    // Small sets (a decode token is ~48 rows -> <= 48 pages) must not pay a thread-pool spawn: creating and joining
+    // 48-64 std::threads costs 2-3 ms on the Altra (measured 2026-09-13; it showed up as -6% decode on the first
+    // production build). Hand the block layer the whole set at once with MADV_WILLNEED (async readahead) and
+    // touch serially: the reads overlap in the device queue, no threads. Warm pages make this a ~50 us no-op.
+    const size_t small = dsv41_engram_prefetch_small();
+    if (mode == 1 && pages.size() <= small) {
+        for (size_t i = 0; i < pages.size(); ) {
+            size_t j = i + 1;
+            while (j < pages.size() && pages[j] == pages[j-1] + page) {
+                ++j;
+            }
+            posix_madvise((void *) pages[i], (pages[j-1] - pages[i]) + page, POSIX_MADV_WILLNEED);
+            i = j;
+        }
+        uint8_t s = 0;
+        for (const uintptr_t pg : pages) {
+            s ^= *(const volatile uint8_t *) pg;
+        }
+        asm volatile("" :: "r"(s));
+        return;
     }
 
     // Blocking faults, but many at once: the point is queue depth, not per-fault latency.
