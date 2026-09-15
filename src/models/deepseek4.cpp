@@ -1004,8 +1004,15 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
-    q = ggml_rms_norm(ctx0, q, norm_rms_eps);
-    cb(q, "q_norm", il);
+    // V4 normalises every head of q after wq_b; V4.1 normalises only the low-rank q (attn_q_a_norm above) and
+    // its target graph (build_attention_v41) applies nothing here. The V4.1 DSpark draft stages reach this
+    // builder through dflash's graph_dsv4 (flavour = no output-hc head, as in dflash.cpp), so skip the
+    // per-head norm for them: with it the draft is "fluent and wrong" (M7 step 4: 8-15 % acceptance).
+    const bool dsv41_draft = model.arch == LLM_ARCH_DFLASH && model.hc_head_fn == nullptr;
+    if (!dsv41_draft) {
+        q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+        cb(q, "q_norm", il);
+    }
 
     q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
             freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
