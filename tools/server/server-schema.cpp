@@ -194,22 +194,24 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     // Speculative decoding params
     //
 
-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
-#if 0
-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
+    // n_max, n_min and p_min are per-request: each can only shrink the draft below what the speculator
+    // was built with, so nothing sized at init can overflow. The rest of the group stays behind #if 0 -
+    // a per-request speculative.type would need another implementation and the ngram knobs resize state.
+    // (The block had never been compiled: the n_min entry below was missing its closing paren.)
     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Maximum number of tokens to draft during speculative decoding"));
 
     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
         ->set_hard_limits(0, INT32_MAX)
-        ->set_desc("Minimum number of draft tokens to use for speculative decoding");
+        ->set_desc("Minimum number of draft tokens to use for speculative decoding"));
 
     add((new field_num("speculative.p_min", params.speculative.draft.p_min))
         ->set_hard_limits(0.0f, 1.0f)
         ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy)"));
 
 
+#if 0
     add((new field_str("speculative.type"))
         ->set_desc("Speculative decoding method (for debugging and research purposes)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

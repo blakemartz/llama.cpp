@@ -1645,14 +1645,17 @@ static void ggml_compute_forward_mul_mat_id(
 
     // upstream #28861: at decode (one row of ids) the shared src1 conversion buffer is written by every
     // thread and read after a barrier. Give each thread its own copy and a static slice of the output
-    // rows of every used expert instead: no barrier, no false sharing. GGML_CPU_NO_MMID_SINGLE_TOKEN=1
-    // restores the shared path for an A/B.
-    static int no_single_token = -1;
-    if (no_single_token < 0) {
-        const char * e = getenv("GGML_CPU_NO_MMID_SINGLE_TOKEN");
-        no_single_token = (e && *e && *e != '0') ? 1 : 0;
+    // rows of every used expert instead: no barrier, no false sharing.
+    // OFF by default here: measured on this box (mmid-bench, 384 x [5120 x 2304] MXFP4, top-6) it is a
+    // regression - 0.252 vs 0.232 ms at 64 threads and 0.980 vs 0.742 ms at 96. Upstream's win is a
+    // two-socket effect; a single-socket 128-core Altra loses the shared buffer's locality and gains
+    // nothing from dropping a barrier it was not waiting on. GGML_CPU_MMID_SINGLE_TOKEN=1 re-enables it.
+    static int want_single_token = -1;
+    if (want_single_token < 0) {
+        const char * e = getenv("GGML_CPU_MMID_SINGLE_TOKEN");
+        want_single_token = (e && *e && *e != '0') ? 1 : 0;
     }
-    const bool single_token = !no_single_token && !iqp && ids->ne[1] == 1 && ne12 == 1 && ne13 == 1;
+    const bool single_token = want_single_token && !iqp && ids->ne[1] == 1 && ne12 == 1 && ne13 == 1;
 
     char * src1_priv = NULL;
     if (single_token && src1->type != vec_dot_type) {
