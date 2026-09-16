@@ -3001,7 +3001,9 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                // the per-request `speculative.n_max` constrains the draft alongside the remaining
+                // context; 0 turns speculation off for this request only
+                const int n_draft_max = std::min(slot.get_n_draft_max(), slot.task->params.speculative.draft.n_max);
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3025,9 +3027,12 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        // per-request `speculative.n_max` / `speculative.p_min` further constrain the
+                        // draft; they can only shrink it below the values the speculator was built with
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
+                            /* .p_min    = */ slot.task->params.speculative.draft.p_min,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,

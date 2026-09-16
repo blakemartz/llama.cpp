@@ -61,6 +61,9 @@ struct common_speculative_draft_params {
     // can be used to constraint the max draft based on the remaining context size
     int32_t n_max = -1;
 
+    // per-sequence override of the draft confidence threshold (< 0 disabled)
+    float p_min = -1.0f;
+
     llama_pos   pos0;
     llama_token id_last;
 
