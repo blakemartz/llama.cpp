@@ -899,20 +899,22 @@ void ggml_vec_dot_mxfp4_q8_0_mcols(int n, float * GGML_RESTRICT s, const void * 
 
     const block_mxfp4 * GGML_RESTRICT x = vx;
 
-    const block_q8_0 * GGML_RESTRICT y0 = vy[0];
-    const block_q8_0 * GGML_RESTRICT y1 = vy[ny > 1 ? 1 : 0];
-    const block_q8_0 * GGML_RESTRICT y2 = vy[ny > 2 ? 2 : 0];
-    const block_q8_0 * GGML_RESTRICT y3 = vy[ny > 3 ? 3 : 0];
+    const block_q8_0 * GGML_RESTRICT yc[GGML_VEC_DOT_MCOLS];
+    for (int j = 0; j < GGML_VEC_DOT_MCOLS; ++j) {
+        yc[j] = vy[j < ny ? j : 0];
+    }
 
     const int nb = n / QK_MXFP4;
 
     const int8x16_t  values = vld1q_s8(kvalues_mxfp4);
     const uint8x16_t m4b    = vdupq_n_u8(0x0f);
 
-    float32x4_t sumv0 = vdupq_n_f32(0.0f);
-    float32x4_t sumv1 = vdupq_n_f32(0.0f);
-    float32x4_t sumv2 = vdupq_n_f32(0.0f);
-    float32x4_t sumv3 = vdupq_n_f32(0.0f);
+    // the column loops below are over a compile-time bound so the accumulators stay in registers
+    float32x4_t sumv[GGML_VEC_DOT_MCOLS];
+#pragma GCC unroll 8
+    for (int j = 0; j < GGML_VEC_DOT_MCOLS; ++j) {
+        sumv[j] = vdupq_n_f32(0.0f);
+    }
 
     int ib = 0;
 
@@ -934,13 +936,19 @@ void ggml_vec_dot_mxfp4_q8_0_mcols(int n, float * GGML_RESTRICT s, const void * 
         e8 = vld1q_lane_u8(&x[ib + 3].e, e8, 12);
         const float32x4_t dx = ggml_e8m0x4_to_fp32_half(vreinterpretq_u32_u8(e8));
 
-                    sumv0 = ggml_vec_dot_mxfp4_q8_0_4blk_col(wl, wh, y0 + ib, dx, sumv0);
-        if (ny > 1) sumv1 = ggml_vec_dot_mxfp4_q8_0_4blk_col(wl, wh, y1 + ib, dx, sumv1);
-        if (ny > 2) sumv2 = ggml_vec_dot_mxfp4_q8_0_4blk_col(wl, wh, y2 + ib, dx, sumv2);
-        if (ny > 3) sumv3 = ggml_vec_dot_mxfp4_q8_0_4blk_col(wl, wh, y3 + ib, dx, sumv3);
+#pragma GCC unroll 8
+        for (int j = 0; j < GGML_VEC_DOT_MCOLS; ++j) {
+            if (j < ny) {
+                sumv[j] = ggml_vec_dot_mxfp4_q8_0_4blk_col(wl, wh, yc[j] + ib, dx, sumv[j]);
+            }
+        }
     }
 
-    float sumf[GGML_VEC_DOT_MCOLS] = { vaddvq_f32(sumv0), vaddvq_f32(sumv1), vaddvq_f32(sumv2), vaddvq_f32(sumv3) };
+    float sumf[GGML_VEC_DOT_MCOLS];
+#pragma GCC unroll 8
+    for (int j = 0; j < GGML_VEC_DOT_MCOLS; ++j) {
+        sumf[j] = vaddvq_f32(sumv[j]);
+    }
 
     for (; ib < nb; ++ib) {
         const float dxs = GGML_E8M0_TO_FP32_HALF(x[ib].e);
