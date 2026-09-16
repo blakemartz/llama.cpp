@@ -116,7 +116,7 @@ extern "C" {
 
     // one src0 row against up to GGML_VEC_DOT_MCOLS columns of src1 gathered by pointer, writing ny results to s.
     // mul_mat_id uses it to unpack a quantized weight block once for several tokens instead of once per token.
-    #define GGML_VEC_DOT_MCOLS 4
+    #define GGML_VEC_DOT_MCOLS 8
 
     typedef void (*ggml_vec_dot_mcols_t)(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT x,
                                          const void * const * GGML_RESTRICT y, int ny);
