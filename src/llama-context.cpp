@@ -535,7 +535,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                 // a weightless fused node whose inputs come from the previous layer is legitimately placed on
                 // that layer's device at a device boundary - that is a scheduler decision, not missing support.
                 // only conclude "unsupported" when this layer's own device cannot run the op.
-                if (device_layer && ggml_backend_dev_supports_op(device_layer, node.tensor)) {
+                static const bool strict_placement = getenv("DSV41_FUSED_PLACEMENT_STRICT") != nullptr;
+                if (!strict_placement && device_layer && ggml_backend_dev_supports_op(device_layer, node.tensor)) {
                     LLAMA_LOG_DEBUG("%s: layer %d is assigned to device %s but %s is assigned to device %s; "
                             "the device supports the op, so this is a placement decision at a layer boundary\n",
                             func, node.il,

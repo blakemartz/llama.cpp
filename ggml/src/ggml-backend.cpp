@@ -1942,14 +1942,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // user-input path synchronizes the split backend's stream; once a cross-device wait for the previous
         // split has been queued on that stream, that synchronize blocks the host until the previous device has
         // finished its entire graph, serializing host and GPU at every split boundary.  upstream #28874
-        for (int pass = 0; pass < 2; pass++)
+        static const bool no_input_reorder = getenv("GGML_SCHED_NO_INPUT_REORDER") != NULL;
+        for (int pass = 0; pass < (no_input_reorder ? 1 : 2); pass++)
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             const bool is_user_input = (input->flags & GGML_TENSOR_FLAG_INPUT) != 0;
-            if ((pass == 0) != is_user_input) {
+            if (!no_input_reorder && (pass == 0) != is_user_input) {
                 continue;
             }
 

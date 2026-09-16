@@ -808,7 +808,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
 
     // tiny-N F32/F16 weights (e.g. hyper-connection projections [K,4], gate projections [K,32]) are latency
     // bound; a single vector kernel beats the cuBLAS GEMM + split-K reduce pair for decode-sized batches
-    if ((type == GGML_TYPE_F32 || type == GGML_TYPE_F16) && src0_ne[1] <= 64 && src0_ne[2] == 1 && src0_ne[3] == 1 &&
+    static const bool no_tiny_n = getenv("GGML_CUDA_NO_MMVF_TINY_N") != nullptr;
+    if (!no_tiny_n &&
+        (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) && src0_ne[1] <= 64 && src0_ne[2] == 1 && src0_ne[3] == 1 &&
         ne11 <= MMVF_MAX_BATCH_SIZE) {
         return true;
     }
