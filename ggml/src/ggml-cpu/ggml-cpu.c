@@ -1484,7 +1484,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const size_t row_size,
     const bool src1_cont,
     const void * wdata,
-    ggml_vec_dot_mcols_t vec_dot_mcols) {
+    ggml_vec_dot_mcols_t vec_dot_mcols,
+    const struct mmid_row_mapping * direct_rows) { // optional row mapping for [ir1_start, ir1_end), upstream #28861
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1503,7 +1504,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
             const int ny = (int) MIN((int64_t) GGML_VEC_DOT_MCOLS, ir1_end - iir1);
 
             for (int j = 0; j < ny; ++j) {
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, iir1 + j);
+                struct mmid_row_mapping row_mapping = direct_rows ? direct_rows[iir1 + j - ir1_start] : MMID_MATRIX_ROW(cur_a, iir1 + j);
 
                 const int      id  = row_mapping.i1; // selected expert index
                 const int64_t  i11 = id % ne11;
@@ -1541,7 +1542,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
                 const int64_t _i12 = ir1; // logical row index for this expert
 
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
+                struct mmid_row_mapping row_mapping = direct_rows ? direct_rows[_i12 - ir1_start] : MMID_MATRIX_ROW(cur_a, _i12);
                 const int id       = row_mapping.i1; // selected expert index
 
                 const int64_t  i11 = id % ne11;
@@ -1642,7 +1643,52 @@ static void ggml_compute_forward_mul_mat_id(
         iqp_panels = incr_ptr_aligned(&wdata_cur, nth * ggml_cpu_iqp_scratch_size(dst), 64);
     }
 
+    // upstream #28861: at decode (one row of ids) the shared src1 conversion buffer is written by every
+    // thread and read after a barrier. Give each thread its own copy and a static slice of the output
+    // rows of every used expert instead: no barrier, no false sharing. GGML_CPU_NO_MMID_SINGLE_TOKEN=1
+    // restores the shared path for an A/B.
+    static int no_single_token = -1;
+    if (no_single_token < 0) {
+        const char * e = getenv("GGML_CPU_NO_MMID_SINGLE_TOKEN");
+        no_single_token = (e && *e && *e != '0') ? 1 : 0;
+    }
+    const bool single_token = !no_single_token && !iqp && ids->ne[1] == 1 && ne12 == 1 && ne13 == 1;
+
+    char * src1_priv = NULL;
+    if (single_token && src1->type != vec_dot_type) {
+        src1_priv = incr_ptr_aligned(&wdata_cur, (size_t) nth * ne11 * ggml_row_size(vec_dot_type, ne10), 64);
+    }
+
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
+
+    if (single_token) {
+        const size_t row_size_st = ggml_row_size(vec_dot_type, ne10);
+        const void * src1_q = src1->data;
+        if (src1_priv) {
+            char * priv = src1_priv + (size_t) ith * ne11 * row_size_st;
+            for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                from_float((const float *) ((const char *) src1->data + i11*nb11), priv + i11*row_size_st, ne10);
+            }
+            src1_q = priv;
+        }
+
+        const int64_t dr0st = (ne01 + nth - 1) / nth;
+        const int64_t ir0_start = dr0st * ith;
+        const int64_t ir0_end   = MIN(ir0_start + dr0st, ne01);
+        if (ir0_start < ir0_end) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t cur_a = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+                GGML_ASSERT(cur_a >= 0 && cur_a < n_as);
+                const struct mmid_row_mapping direct = { id, 0 };
+                ggml_compute_forward_mul_mat_id_one_chunk(
+                    dst, src0, src1, ids, cur_a,
+                    ir0_start, ir0_end, 0, 1,
+                    (const char *) src0->data + cur_a*nb02, NULL, row_size_st, src1_cont, src1_q,
+                    vec_dot_mcols, &direct);
+            }
+        }
+        return;
+    }
 
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
@@ -1763,7 +1809,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata, vec_dot_mcols
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, vec_dot_mcols, NULL
             );
 
             if (nth >= nchunk0 * nchunk1) {
@@ -2954,6 +3000,10 @@ struct ggml_cplan ggml_graph_plan(
                         // the IQ panel path needs one scratch panel per thread on top of that
                         if (ggml_cpu_iqp_supports_mul_mat_id(node)) {
                             cur += n_tasks * ggml_cpu_iqp_scratch_size(node) + 64;
+                        }
+                        // single-token fast path: a private converted src1 per thread (upstream #28861)
+                        if (src1->type != vec_dot_type && ids->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1) {
+                            cur += (size_t) n_tasks * src1->ne[1] * ggml_row_size(vec_dot_type, src1->ne[0]) + 64;
                         }
                     } break;
                 case GGML_OP_OUT_PROD:
