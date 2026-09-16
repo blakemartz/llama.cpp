@@ -532,6 +532,19 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
             if (device_fused != device_layer) {
+                // a weightless fused node whose inputs come from the previous layer is legitimately placed on
+                // that layer's device at a device boundary - that is a scheduler decision, not missing support.
+                // only conclude "unsupported" when this layer's own device cannot run the op.
+                if (device_layer && ggml_backend_dev_supports_op(device_layer, node.tensor)) {
+                    LLAMA_LOG_DEBUG("%s: layer %d is assigned to device %s but %s is assigned to device %s; "
+                            "the device supports the op, so this is a placement decision at a layer boundary\n",
+                            func, node.il,
+                            ggml_backend_dev_name(device_layer),
+                            probe.name,
+                            device_fused ? ggml_backend_dev_name(device_fused) : "none");
+                    continue;
+                }
+
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
                         func, node.il,
