@@ -654,6 +654,53 @@ class TQ2_0(__Quant, qtype=GGMLQuantizationType.TQ2_0):
         return (d * qs.astype(np.float32))
 
 
+class MXFP8(__Quant, qtype=GGMLQuantizationType.MXFP8):
+    # MX-FP8: E4M3 elements with one E8M0 (power-of-two) scale per 32. This is how DeepSeek-V4.1 ships
+    # its Engram tables, so storing them in it is a re-layout rather than a requantization.
+    # ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+
+    @staticmethod
+    # see ggml_e4m3_to_fp32 in ggml-impl.h - OCP float8_e4m3fn, no inf, S.1111.111 the only NaN
+    def e4m3_lut() -> np.ndarray:
+        v = np.zeros(256, dtype=np.float32)
+        for b in range(256):
+            sg, e, m = b >> 7, (b >> 3) & 0xF, b & 0x7
+            if e == 0:
+                x = (m / 8.0) * 2.0 ** -6
+            elif e == 15 and m == 7:
+                x = np.nan
+            else:
+                x = (1.0 + m / 8.0) * 2.0 ** (e - 7)
+            v[b] = -x if sg else x
+        return v
+
+    @staticmethod
+    # see ggml_e8m0_to_fp32 in ggml-impl.h
+    def e8m0_to_fp32(x: np.ndarray) -> np.ndarray:
+        return np.ldexp(np.ones(x.shape, dtype=np.float64), x.astype(np.int32) - 127).astype(np.float32)
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        amax = np.abs(blocks).max(axis=-1, keepdims=True)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            e = np.where(amax > 0, np.clip(np.floor(np.log2(amax)) - 8 + 127, 0, 254), 127).astype(np.uint8)
+        d = cls.e8m0_to_fp32(e)
+        lut = cls.e4m3_lut()
+        cand = lut[:127]                                        # finite non-negative codes
+        scaled = (blocks / np.where(d > 0, d, 1.0)).astype(np.float32)
+        mag = np.abs(scaled).reshape(n_blocks, cls.block_size, 1)
+        best = np.argmin(np.abs(mag - cand.reshape(1, 1, -1)), axis=-1).astype(np.uint8)
+        qs = best | np.where(scaled < 0, np.uint8(0x80), np.uint8(0)).astype(np.uint8)
+        return np.concatenate([e, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        e, qs = np.hsplit(blocks, [1])
+        d = cls.e8m0_to_fp32(e)
+        return (cls.e4m3_lut()[qs] * d).astype(np.float32)
+
+
 class MXFP4(__Quant, qtype=GGMLQuantizationType.MXFP4):
     # e2m1 values (doubled)
     # ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf

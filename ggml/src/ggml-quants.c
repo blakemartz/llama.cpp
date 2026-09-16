@@ -566,6 +566,55 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// MX-FP8, the format DeepSeek-V4.1 ships its Engram tables in: E4M3 elements with one E8M0 scale per 32.
+// Storing the tables in it is a pure re-layout of the checkpoint - no requantization, so no loss.
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_E8M0_TO_FP32(x[i].e);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = ggml_e4m3_to_fp32(x[i].qs[j]) * d;
+        }
+    }
+}
+
+void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+
+        for (int j = 0; j < qk; j++) {
+            const float v = fabsf(x[i*qk + j]);
+            if (amax < v) {
+                amax = v;
+            }
+        }
+
+        // OCP MX: the shared scale is a power of two chosen so the block max lands in E4M3's top binade
+        // (max normal 448 = 2^8 * 1.75), i.e. exponent floor(log2(amax)) - 8.
+        const uint8_t e = amax > 0.0f ? (uint8_t) MAX(0, MIN(254, (int) floorf(log2f(amax)) - 8 + 127)) : 127;
+        const float   d = GGML_E8M0_TO_FP32(e);
+        const float  id = d > 0.0f ? 1.0f/d : 0.0f;
+
+        y[i].e = e;
+
+        for (int j = 0; j < qk; ++j) {
+            y[i].qs[j] = ggml_fp32_to_e4m3(x[i*qk + j] * id);
+        }
+    }
+}
+
 void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 

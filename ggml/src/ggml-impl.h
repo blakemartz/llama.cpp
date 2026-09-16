@@ -509,6 +509,79 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
+// E4M3 (OCP float8_e4m3fn): sign, 4 exp bits (bias 7), 3 mantissa bits. No infinities; S.1111.111 is
+// the only NaN. Subnormals are man/8 * 2^-6. This is the element format of the MX-FP8 pair that
+// DeepSeek-V4.1 ships its Engram tables in, so decoding it exactly is what keeps the table lossless.
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const uint32_t sign = (uint32_t) (x & 0x80) << 24;
+    const int      exp  = (x >> 3) & 0xF;
+    const int      man  = x & 0x7;
+
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) {
+            bits = 0;                                   // +-0
+        } else {
+            // subnormal: value = man * 2^-9. Normalize so the leading bit sits at 0x4, which makes the
+            // value (m/4) * 2^(2-shift-9) = 1.xx * 2^(-7-shift), i.e. fp32 exponent field 120 - shift.
+            int shift = 0;
+            int m = man;
+            while ((m & 0x4) == 0) { m <<= 1; shift++; }
+            bits = ((uint32_t) (127 - 7 - shift) << 23) | ((uint32_t) (m & 0x3) << 21);
+        }
+    } else if (exp == 0xF && man == 0x7) {
+        bits = 0x7FC00000;                              // the single NaN pattern
+    } else {
+        bits = ((uint32_t) (exp - 7 + 127) << 23) | ((uint32_t) man << 20);
+    }
+
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return sign ? -result : result;
+}
+
+// E4M3 encode, the signed counterpart of ggml_fp32_to_ue4m3 below. float8_e4m3fn saturates instead of
+// overflowing to infinity, so anything above 448 clamps to the largest finite magnitude.
+static inline uint8_t ggml_fp32_to_e4m3(float x) {
+    if (x != x) {
+        return 0x7F;                       // the single NaN pattern
+    }
+    const uint8_t sign = x < 0.0f || (x == 0.0f && 1.0f/x < 0.0f) ? 0x80 : 0x00;
+    float a = fabsf(x);
+    if (a == 0.0f) {
+        return sign;
+    }
+    if (a > 448.0f) {
+        return (uint8_t) (sign | 0x7E);
+    }
+    uint32_t bits;
+    memcpy(&bits, &a, 4);
+    int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    int fp32_man = (bits >> 20) & 0x7;
+    int e4m3_exp = fp32_exp + 7;
+    if (e4m3_exp <= 0) {
+        // subnormal: value = man * 2^-9
+        int man = (int) (a * 512.0f + 0.5f);
+        if (man > 7) {
+            man = 7;
+        }
+        return (uint8_t) (sign | man);
+    }
+    int round_bit = (bits >> 19) & 1;
+    int e4m3_man  = fp32_man + round_bit;
+    if (e4m3_man > 7) {
+        e4m3_man = 0;
+        e4m3_exp++;
+    }
+    if (e4m3_exp >= 15 && e4m3_man >= 7) {
+        return (uint8_t) (sign | 0x7E);    // 0x7F is NaN, so the largest finite is 0x7E
+    }
+    if (e4m3_exp > 15) {
+        return (uint8_t) (sign | 0x7E);
+    }
+    return (uint8_t) (sign | (e4m3_exp << 3) | e4m3_man);
+}
+
 // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
 // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {
