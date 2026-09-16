@@ -1937,11 +1937,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         int n_copies_split = 0;
 
-        // copy the input tensors to the split backend
+        // copy the input tensors to the split backend, user inputs first, then the outputs of other splits.
+        // without pipeline parallelism (no events, which is the case whenever tensor overrides are used) the
+        // user-input path synchronizes the split backend's stream; once a cross-device wait for the previous
+        // split has been queued on that stream, that synchronize blocks the host until the previous device has
+        // finished its entire graph, serializing host and GPU at every split boundary.  upstream #28874
+        for (int pass = 0; pass < 2; pass++)
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            const bool is_user_input = (input->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+            if ((pass == 0) != is_user_input) {
+                continue;
+            }
 
             // skip the copy when this copy tensor already holds exactly these bytes and nothing computed since has
             // written to them - this is what turns the deduplicated views into a single copy per graph compute
@@ -1967,7 +1977,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // cached as holding the source
             bool partial_copy = false;
 
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if (is_user_input) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -2087,7 +2097,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             // a user input may be overwritten by the application between computes, and a partial copy does not hold
             // the whole source: neither may be reused
-            if (!(input->flags & GGML_TENSOR_FLAG_INPUT) && !partial_copy) {
+            if (!is_user_input && !partial_copy) {
                 copied.push_back({ input_cpy, input });
             }
         }
