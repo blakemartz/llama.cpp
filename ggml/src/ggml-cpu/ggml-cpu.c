@@ -1739,11 +1739,32 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
+                // a negative id means "this (slot, token) is not this op's to compute". Used by the MoE CPU
+                // assist, which hands the CPU a sub-range of the experts: the CPU's cost scales with
+                // token-expert PAIRS, so the out-of-range pairs have to be dropped rather than clamped onto
+                // some other expert. Their dst rows are zeroed below - nothing else writes them.
+                if (i02 < 0) {
+                    continue;
+                }
+
                 assert(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
+        }
+    }
+
+    // zero the dst rows of any skipped (slot, token) pair - the compute loop below only writes rows that are
+    // in matrix_rows, so a skipped row would otherwise hand downstream whatever ggml-alloc left there.
+    // Derived from ids rather than from a materialised skip list, and split across threads; no two threads
+    // touch the same row, and no row here is touched by the compute loop.
+    for (int64_t p = ith; p < ids->ne[0]*ids->ne[1]; p += nth) {
+        const int64_t id   = p % ids->ne[0];
+        const int64_t iid1 = p / ids->ne[0];
+        const int32_t i02  = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+        if (i02 < 0) {
+            memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
         }
     }
 

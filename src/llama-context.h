@@ -384,6 +384,12 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // one-shot log guard for the MoE CPU assist pin count
+    int n_moe_cpu_pinned_logged = 0;
+
+    // pin the MoE CPU-assist nodes to the CPU backend (no-op unless LLAMA_MOE_CPU_ASSIST > 0)
+    void moe_cpu_assist_pin(ggml_cgraph * gf);
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

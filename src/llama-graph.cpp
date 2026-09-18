@@ -1946,6 +1946,17 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// LLAMA_MOE_CPU_ASSIST = percent of the experts handed to the CPU in each expert matmul (0 = off).
+// The modelled balance on this box is 33: GPU (1-f)*21.2 ms of transfer against CPU f*42.2 ms of GEMM.
+static int moe_cpu_assist_pct() {
+    static const int pct = [] {
+        const char * e = getenv("LLAMA_MOE_CPU_ASSIST");
+        const int v = e ? atoi(e) : 0;
+        return v < 0 ? 0 : (v > 90 ? 90 : v);
+    }();
+    return pct;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2166,6 +2177,97 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    // LLAMA_MOE_CPU_ASSIST=<percent>: give the Altra that percentage of the EXPERTS in every one of this
+    // layer's expert matmuls, to compute while the GPU streams the rest.
+    //
+    // Op granularity was tried first (2026-09-18) and is structurally incapable of winning: `down` consumes
+    // silu(gate)*up, so it follows both halves, and a layer costs max(GPU 21.2, CPU 42.2) + 21.2 = 63.4 ms
+    // against today's 63.5. A win needs the CPU's share UNDER one op's transfer, i.e. below half an op, which
+    // only a sub-op split expresses. Per op the split costs max((1-f)*21.2, f*42.2), balanced at f = 0.334.
+    //
+    // GPU half: ids CLAMPED into [0,k). Out-of-range slots then compute a real, finite expert and are zeroed
+    // by mask_g afterwards - so no CUDA kernel change, and the sched's partial-copy sees only ids < k, which
+    // is what makes the transfer scale with k.
+    // CPU half: ids outside [k,n_expert) become -1, and ggml-cpu's mul_mat_id skips those and zeroes their
+    // dst rows (the one kernel change). A sentinel is needed rather than a clamp because the CPU's cost
+    // scales with token-expert PAIRS - clamping would leave it computing all of them.
+    // Each slot is therefore live in exactly one half, and the halves are combined with a plain add.
+    //
+    // Every CPU-side node is named "moe_cpu_*" and pinned to the CPU backend in llama_context::process_ubatch.
+    // The staging of `cur` and the ids is emitted BEFORE the GPU ops on purpose: a CPU split holding any
+    // un-staged GPU input makes compute_splits fall back to ggml_backend_synchronize(CUDA), draining the
+    // transfers this is meant to overlap with - which is exactly how the op-granularity attempt serialized.
+    const int moe_cpu_pct = moe_cpu_assist_pct();
+    const bool moe_split  = moe_cpu_pct > 0 && !gate_up_exps && up_exps && up_exps->buffer &&
+                            ggml_backend_buffer_is_host(up_exps->buffer) && n_expert > 1 && loras->empty();
+    ggml_tensor * mask_g  = nullptr;
+    ggml_tensor * ids_g   = nullptr;
+    ggml_tensor * ids_c   = nullptr;
+    ggml_tensor * ids_c_ok = nullptr;
+    ggml_tensor * cur_cpu = nullptr;
+    if (moe_split) {
+        int nm = 0;
+        auto nm_cpu = [&](ggml_tensor * t) { ggml_format_name(t, "moe_cpu_%d-%d", il, nm++); return t; };
+
+        const int64_t k = n_expert - (n_expert * moe_cpu_pct) / 100;   // GPU keeps experts [0, k)
+        ggml_tensor * f_ids = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);   // [n_expert_used, n_tokens]
+
+        ids_g  = ggml_cast(ctx0, ggml_clamp(ctx0, f_ids, 0.0f, (float) (k - 1)), GGML_TYPE_I32);
+        // 1 where id < k, else 0:  clamp(k - id, 0, 1)
+        mask_g = ggml_reshape_3d(ctx0,
+                     ggml_clamp(ctx0, ggml_scale_bias(ctx0, f_ids, -1.0f, (float) k), 0.0f, 1.0f),
+                     1, n_expert_used, n_tokens);
+
+        cur_cpu = nm_cpu(ggml_dup(ctx0, cur));
+        ggml_build_forward_expand(gf, cur_cpu);
+
+        // NOT ggml_dup on the I32 ids: the dup dispatch has no I32 -> I32 case and aborts. Stage the F32
+        // form instead and rebuild the ids on the CPU; expert ids round-trip through F32 exactly.
+        ggml_tensor * fc  = nm_cpu(ggml_dup(ctx0, f_ids));
+        // 1 where id >= k, else 0:  clamp(id - (k-1), 0, 1)
+        ggml_tensor * sel = nm_cpu(ggml_clamp(ctx0, nm_cpu(ggml_scale_bias(ctx0, fc, 1.0f, -(float) (k - 1))), 0.0f, 1.0f));
+        // sel*(id+1) - 1  ->  id where sel==1, -1 where sel==0
+        ggml_tensor * idc_f = nm_cpu(ggml_scale_bias(ctx0,
+                                  nm_cpu(ggml_mul(ctx0, sel, nm_cpu(ggml_scale_bias(ctx0, fc, 1.0f, 1.0f)))),
+                                  1.0f, -1.0f));
+        ids_c = nm_cpu(ggml_cast(ctx0, idc_f, GGML_TYPE_I32));
+        // the same ids with the sentinels folded back to a valid row, for the per-expert scale's get_rows:
+        // -1 there is an out-of-bounds read, and the matmul output is already zero on those slots anyway
+        ids_c_ok = nm_cpu(ggml_cast(ctx0, nm_cpu(ggml_clamp(ctx0, idc_f, 0.0f, (float) (n_expert - 1))),
+                                    GGML_TYPE_I32));
+        ggml_build_forward_expand(gf, ids_c);
+        ggml_build_forward_expand(gf, ids_c_ok);
+    }
+
+    // one expert matmul, split across the two devices when the assist is on
+    int moe_nm = 0;
+    auto split_mm_id = [&](ggml_tensor * w, ggml_tensor * x, ggml_tensor * w_s, const char * tag) -> ggml_tensor * {
+        if (!moe_split) {
+            return build_lora_mm_id(w, x, selected_experts, w_s);
+        }
+        // GPU half: build_lora_mm_id is safe here, ids_g is clamped into range
+        ggml_tensor * g = ggml_mul(ctx0, build_lora_mm_id(w, x, ids_g, w_s), mask_g);
+
+        // CPU half: built explicitly rather than through build_lora_mm_id. With a per-expert scale present
+        // that helper returns a LATER ggml_mul, so naming only its result leaves the real mul_mat_id - and
+        // the get_rows that indexes the scale - unnamed, unpinned, and promoted onto a GPU by op-offload,
+        // with -1 sentinels in the ids. That is an illegal memory access, and it is how this first crashed.
+        const int n = moe_nm++;
+        ggml_tensor * c = ggml_mul_mat_id(ctx0, w, (cur_cpu && x == cur) ? cur_cpu : x, ids_c);
+        ggml_format_name(c, "moe_cpu_%d-%s%d", il, tag, n);
+        if (w_s) {
+            ggml_tensor * sc = ggml_reshape_3d(ctx0, w_s, 1, w_s->ne[0], 1);
+            ggml_format_name(sc, "moe_cpu_%d-%ss%d", il, tag, n);
+            sc = ggml_repeat_4d(ctx0, sc, 1, w_s->ne[0], n_tokens, 1);
+            ggml_format_name(sc, "moe_cpu_%d-%sr%d", il, tag, n);
+            sc = ggml_get_rows(ctx0, sc, ids_c_ok);
+            ggml_format_name(sc, "moe_cpu_%d-%sg%d", il, tag, n);
+            c = ggml_mul(ctx0, c, sc);
+            ggml_format_name(c, "moe_cpu_%d-%sm%d", il, tag, n);
+        }
+        return ggml_add(ctx0, g, c);
+    };
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
@@ -2187,7 +2289,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        // the up projection is the one handed to the CPU when the assist is on: gate and up are independent,
+        // and up's output is the smaller of the two things that would have to come back over PCIe
+        up = split_mm_id(up_exps, cur, up_exps_s, "up"); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2200,7 +2304,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = split_mm_id(gate_exps, cur, gate_exps_s, "gate"); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;

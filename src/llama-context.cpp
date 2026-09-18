@@ -1414,6 +1414,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        moe_cpu_assist_pin(gf);
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2466,6 +2468,37 @@ static void ubatch_prepare_reserve(
     }
 }
 
+// MoE CPU assist (LLAMA_MOE_CPU_ASSIST, see build_moe_ffn): pin every node of the CPU half to the CPU
+// backend. Must run on EVERY path that builds a graph and then lets the scheduler split it - both
+// process_ubatch and graph_reserve. Missing it in graph_reserve cost a load: op-offload promoted the
+// unpinned CPU-half matmuls back onto CUDA0, which then reserved a full expert staging buffer for each of
+// them and asked for 7407 MiB. It has to sit between build_graph and the split, because
+// ggml_backend_sched_reset clears these assignments and split_graph's pass 1 honours them
+// ("do not overwrite user assignments").
+void llama_context::moe_cpu_assist_pin(ggml_cgraph * gf) {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_MOE_CPU_ASSIST");
+        return e && atoi(e) > 0;
+    }();
+    if (!enabled || backend_cpu == nullptr || gf == nullptr) {
+        return;
+    }
+    // name prefix ONLY: every node of the CPU half is named in build_moe_ffn. Matching on srcs instead
+    // would also catch the add that joins the two halves, which belongs on the GPU.
+    int n_pinned = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (strncmp(node->name, "moe_cpu_", 8) == 0) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), node, backend_cpu);
+            n_pinned++;
+        }
+    }
+    if (n_pinned > 0 && n_moe_cpu_pinned_logged == 0) {
+        LLAMA_LOG_WARN("%s: MoE CPU assist: pinned %d nodes to the CPU backend\n", __func__, n_pinned);
+        n_moe_cpu_pinned_logged = n_pinned;
+    }
+}
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -2506,6 +2539,8 @@ ggml_cgraph * llama_context::graph_reserve(
     auto * gf = model.build_graph(gparams);
 
     this->n_outputs = save_n_outputs;
+
+    moe_cpu_assist_pin(gf);
 
     // initialize scheduler with the specified graph
     if (split_only) {
