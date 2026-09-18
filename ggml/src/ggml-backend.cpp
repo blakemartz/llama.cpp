@@ -857,6 +857,15 @@ static const struct ggml_tensor * ggml_backend_sched_view_base(const struct ggml
     return t->view_src ? t->view_src : t;
 }
 
+// a split input that is a WEIGHT in host memory: the source of the op-offload weight streaming. Looks through
+// view_src, because a view of a weight has a null buffer of its own (the neighbouring tests at the op-offload
+// decision and in compute_splits do not, which is harmless only as long as nothing builds views of weights).
+static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+    const ggml_backend_buffer_t buf = ggml_backend_sched_view_base(t)->buffer;
+    return buf != NULL && ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS
+                       && ggml_backend_buffer_is_host(buf);
+}
+
 // a tensor stands for its own bytes at the time it is read: either it is not a view, or it is a pure view op (which
 // computes nothing). An op that writes through a view of its destination (set_rows, cpy, the in-place ops) does not
 // qualify - what it holds depends on when it is read. User inputs never qualify: the application may rewrite them.
@@ -1632,15 +1641,33 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             }
                         } else {
                             ggml_backend_t backend = sched->backends[cur_backend_id];
+                            // A staging copy of a host WEIGHT gets ONE tensor shared by every copy slot, with no
+                            // INPUT/OUTPUT flags, so ggml-alloc keeps reusing its memory. Under pipeline parallelism
+                            // the generic path below does the opposite - n_copies tensors, each pinned for the whole
+                            // graph - which is right for activations, whose producer is another split that may still
+                            // be reading the previous graph's bytes, and ruinous for weights: op-offload stages full
+                            // expert tensors (here 2.407 GB each, 66 of them), and they only fit at all because they
+                            // share one reused region. A weight needs neither: its source is host memory that nobody
+                            // in the graph writes, and every read and every overwrite of the staging buffer is issued
+                            // on the consuming device's own stream, so stream order alone keeps ubatch i's kernel
+                            // ahead of ubatch i+1's copy.
+                            const bool weight = ggml_backend_sched_is_host_weight(src);
+                            struct ggml_tensor * shared = NULL;
                             for (int c = 0; c < sched->n_copies; c++) {
-                                struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                                ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                                if (sched->n_copies > 1) {
-                                    ggml_set_input(tensor_copy);
-                                    ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                                struct ggml_tensor * tensor_copy = shared;
+                                if (tensor_copy == NULL) {
+                                    tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                                    ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                                    if (sched->n_copies > 1 && !weight) {
+                                        ggml_set_input(tensor_copy);
+                                        ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                                    }
+                                    SET_CAUSE(tensor_copy, "%s", weight ? "4.cpyw" : "4.cpy");
+                                    if (weight) {
+                                        shared = tensor_copy;
+                                    }
                                 }
                                 tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
-                                SET_CAUSE(tensor_copy, "4.cpy");
                             }
                             view_inputs.push_back({ cur_backend_id, src });
                         }
@@ -1819,6 +1846,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             for (int j = 0; j < split->n_inputs; j++) {
                 struct ggml_tensor * input = split->inputs[j];
                 size_t id = hash_id(input);
+                // Registering a copy as a leaf is the other half of pinning it: leafs are allocated up front and
+                // live for the whole graph, where a node's memory is reused once its last consumer has passed.
+                // A staging copy of a host weight is ONE tensor shared by every slot (see split_graph) precisely
+                // so that it can be reused, and it is already added as a node above - so skip it here, or the
+                // exemption buys nothing. Detected by the slots aliasing, which is exactly the shared case.
+                if (tensor_id_copy(id, backend_id, 0) == tensor_id_copy(id, backend_id, 1)) {
+                    continue;
+                }
                 for (int c = 0; c < sched->n_copies; c++) {
                     struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
                     sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
@@ -2192,6 +2227,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+
+    // pipeline depth is a memory/throughput trade (n_copies staging tensors per non-weight split input), and the
+    // useful depth here is the number of devices in the chain, not the compile-time maximum. GGML_SCHED_N_COPIES
+    // sets it without a rebuild; it can only lower the depth, never enable pipelining that the caller did not ask for.
+    const char * GGML_SCHED_N_COPIES = getenv("GGML_SCHED_N_COPIES");
+    if (GGML_SCHED_N_COPIES && parallel) {
+        const int n = atoi(GGML_SCHED_N_COPIES);
+        sched->n_copies = std::max(1, std::min(n, GGML_SCHED_MAX_COPIES));
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)

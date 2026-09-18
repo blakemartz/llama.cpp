@@ -432,6 +432,22 @@ llama_context::llama_context(
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
+        // LLAMA_PIPELINE_PARALLEL overrides the conditions above. The -ot exclusion is there because a tensor
+        // override can put a weight in host memory, and op-offload then stages that weight on the device - which
+        // under pipeline parallelism used to mean n_copies pinned staging tensors per weight. That is fixed in
+        // ggml_backend_sched_split_graph (weights share one reusable staging tensor), so the exclusion is now a
+        // memory guard with nothing left to guard; it stays the default until this path has been measured on more
+        // than one configuration. The devices of an -ot/RPC layer split are a strict dependency chain within a
+        // ubatch, so without this there is no way for two of them to be busy at once.
+        {
+            const char * LLAMA_PIPELINE_PARALLEL = getenv("LLAMA_PIPELINE_PARALLEL");
+            if (LLAMA_PIPELINE_PARALLEL) {
+                pipeline_parallel = atoi(LLAMA_PIPELINE_PARALLEL) != 0;
+                LLAMA_LOG_WARN("%s: pipeline parallelism forced %s by LLAMA_PIPELINE_PARALLEL\n",
+                        __func__, pipeline_parallel ? "ON" : "OFF");
+            }
+        }
+
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
