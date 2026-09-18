@@ -1948,6 +1948,18 @@ ggml_tensor * llm_graph_context::build_ffn(
 
 // LLAMA_MOE_CPU_ASSIST = percent of the experts handed to the CPU in each expert matmul (0 = off).
 // The modelled balance on this box is 33: GPU (1-f)*21.2 ms of transfer against CPU f*42.2 ms of GEMM.
+// LLAMA_MOE_CPU_ASSIST_MODE bisects the two halves when the split misbehaves (0 = normal):
+//   1 = GPU half keeps the ORIGINAL ids (mask still applied, so results stay correct) -> isolates the clamp
+//   2 = CPU half uses the clamped ids instead of the -1 sentinels -> isolates the sentinel
+// Mode 1 streams every expert and mode 2 makes the CPU compute every pair, so both are slow by design.
+static int moe_cpu_assist_mode() {
+    static const int m = [] {
+        const char * e = getenv("LLAMA_MOE_CPU_ASSIST_MODE");
+        return e ? atoi(e) : 0;
+    }();
+    return m;
+}
+
 static int moe_cpu_assist_pct() {
     static const int pct = [] {
         const char * e = getenv("LLAMA_MOE_CPU_ASSIST");
@@ -2209,14 +2221,32 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         int nm = 0;
         auto nm_cpu = [&](ggml_tensor * t) { ggml_format_name(t, "moe_cpu_%d-%d", il, nm++); return t; };
 
-        const int64_t k = n_expert - (n_expert * moe_cpu_pct) / 100;   // GPU keeps experts [0, k)
+        // top-k routing guarantees a token's n_expert_used ids are DISTINCT, and ggml_cuda's mm_ids_helper
+        // builds its per-expert row lists on that invariant. CLAMPING out-of-range ids breaks it - a token
+        // routed to experts 300 and 350 would get two slots on k-1 - and walks the helper out of bounds
+        // (illegal memory access in ggml_cuda_mul_mat_q; bisected 2026-09-18 with MODE=1).
+        //
+        // So the map into the GPU's range has to be INJECTIVE. Reserve the top n_expert_used experts of the
+        // range as sentinel targets: real experts are [0, k_real), and an out-of-range slot j goes to
+        // k_real + j. Those are distinct across slots and strictly above every in-range id, so per-token
+        // distinctness holds by construction. The cost is n_expert_used experts staged and computed for
+        // nothing (their output is zeroed by mask_g), ~+16 % of the GPU's staging.
+        const int64_t k      = n_expert - (n_expert * moe_cpu_pct) / 100;
+        const int64_t k_real = k - n_expert_used;                    // GPU computes experts [0, k_real)
         ggml_tensor * f_ids = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);   // [n_expert_used, n_tokens]
 
-        ids_g  = ggml_cast(ctx0, ggml_clamp(ctx0, f_ids, 0.0f, (float) (k - 1)), GGML_TYPE_I32);
-        // 1 where id < k, else 0:  clamp(k - id, 0, 1)
-        mask_g = ggml_reshape_3d(ctx0,
-                     ggml_clamp(ctx0, ggml_scale_bias(ctx0, f_ids, -1.0f, (float) k), 0.0f, 1.0f),
-                     1, n_expert_used, n_tokens);
+        // 1 where id < k_real, else 0:  clamp(k_real - id, 0, 1)
+        ggml_tensor * m2 = ggml_clamp(ctx0, ggml_scale_bias(ctx0, f_ids, -1.0f, (float) k_real), 0.0f, 1.0f);
+        mask_g = ggml_reshape_3d(ctx0, m2, 1, n_expert_used, n_tokens);
+
+        // slot index per (slot, token), 0..n_expert_used-1
+        ggml_tensor * slot = ggml_repeat(ctx0, ggml_arange(ctx0, 0.0f, (float) n_expert_used, 1.0f), f_ids);
+        // id where in range, else k_real + slot
+        ggml_tensor * inv  = ggml_scale_bias(ctx0, m2, -1.0f, 1.0f);              // 1 - mask
+        ggml_tensor * idg_f = ggml_add(ctx0,
+                                  ggml_mul(ctx0, f_ids, m2),
+                                  ggml_mul(ctx0, ggml_scale_bias(ctx0, slot, 1.0f, (float) k_real), inv));
+        ids_g = moe_cpu_assist_mode() == 1 ? selected_experts : ggml_cast(ctx0, idg_f, GGML_TYPE_I32);
 
         cur_cpu = nm_cpu(ggml_dup(ctx0, cur));
         ggml_build_forward_expand(gf, cur_cpu);
@@ -2225,7 +2255,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // form instead and rebuild the ids on the CPU; expert ids round-trip through F32 exactly.
         ggml_tensor * fc  = nm_cpu(ggml_dup(ctx0, f_ids));
         // 1 where id >= k, else 0:  clamp(id - (k-1), 0, 1)
-        ggml_tensor * sel = nm_cpu(ggml_clamp(ctx0, nm_cpu(ggml_scale_bias(ctx0, fc, 1.0f, -(float) (k - 1))), 0.0f, 1.0f));
+        ggml_tensor * sel = nm_cpu(ggml_clamp(ctx0, nm_cpu(ggml_scale_bias(ctx0, fc, 1.0f, -(float) (k_real - 1))), 0.0f, 1.0f));
         // sel*(id+1) - 1  ->  id where sel==1, -1 where sel==0
         ggml_tensor * idc_f = nm_cpu(ggml_scale_bias(ctx0,
                                   nm_cpu(ggml_mul(ctx0, sel, nm_cpu(ggml_scale_bias(ctx0, fc, 1.0f, 1.0f)))),
@@ -2253,7 +2283,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the get_rows that indexes the scale - unnamed, unpinned, and promoted onto a GPU by op-offload,
         // with -1 sentinels in the ids. That is an illegal memory access, and it is how this first crashed.
         const int n = moe_nm++;
-        ggml_tensor * c = ggml_mul_mat_id(ctx0, w, (cur_cpu && x == cur) ? cur_cpu : x, ids_c);
+        ggml_tensor * c = ggml_mul_mat_id(ctx0, w, (cur_cpu && x == cur) ? cur_cpu : x,
+                                          moe_cpu_assist_mode() == 2 ? ids_c_ok : ids_c);
         ggml_format_name(c, "moe_cpu_%d-%s%d", il, tag, n);
         if (w_s) {
             ggml_tensor * sc = ggml_reshape_3d(ctx0, w_s, 1, w_s->ne[0], 1);

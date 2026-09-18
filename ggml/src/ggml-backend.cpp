@@ -1956,7 +1956,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
+        // GGML_SCHED_RELAX_SPLIT_BARRIER: this barrier exists so that a split does not start while the
+        // previous one's async work is still live, because ggml-alloc may have reused buffer regions across
+        // them. ggml-alloc allocates per BUFFER TYPE and never reuses memory between two different ones, so
+        // when the two splits sit on different bufts there is no aliasing to guard against - the data
+        // dependencies are carried by the input copies, not by this.
+        // It matters because a split whose sources are ALL already on its own backend has n_inputs == 0 and
+        // takes this path: the MoE CPU assist stages its activations and ids to the CPU early precisely so
+        // the CPU half has no cross-device inputs, which left it synchronising on the GPU split before it
+        // and serialised the very work it was meant to overlap (measured 2026-09-18, twice).
+        static const bool relax_barrier = getenv("GGML_SCHED_RELAX_SPLIT_BARRIER") != NULL;
         auto sync_prev_split = [&]() {
+            if (relax_barrier && prev_backend_id >= 0 &&
+                    sched->bufts[prev_backend_id] != sched->bufts[split_backend_id]) {
+                return;
+            }
             if (prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
                 if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
