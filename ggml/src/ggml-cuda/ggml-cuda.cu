@@ -4609,6 +4609,30 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     const int min_fan_out = 3;
     const int max_fan_out = 3;
 
+    // DSV41 DIAGNOSTIC (2026-09-19, log-only, no behaviour change). The gates below are written for the
+    // QKV fan-out of a dense attention: exactly 3 consumers, and a root node literally named "attn_norm"
+    // (with a TODO to generalise). DeepSeek-V4.1 is MLA - attn_norm feeds wq_a and wkv and nothing else,
+    // a fan-out of 2 - so the pass is expected to find NOTHING on this model, and the `continue` for a
+    // non-attn_norm root happens before any existing log line, so a silent run tells us nothing about
+    // WHICH forks were nearly eligible.
+    //
+    // This census prints every fan-out root the pass considered, with its name, op and degree, so the
+    // real question can be answered from evidence instead of from reading the graph builder: is there a
+    // fan-out of 2 at attn_norm (the MLA q/kv split) and another at the mHC fork (inpL -> statistics +
+    // pre-mix/attention, which SGLang overlap at +22 % on BS=1)? Only reached under GGML_CUDA_GRAPH_OPT=1.
+    if (getenv("GGML_CUDA_GRAPH_OPT_CENSUS") != nullptr) {
+        std::map<std::pair<std::string, int>, int> census;   // {name, degree} -> occurrences
+        for (const auto & [root_node, count] : fan_out) {
+            if (count >= 2 && root_node != nullptr) {
+                census[{ std::string(root_node->name), count }]++;
+            }
+        }
+        GGML_LOG_INFO("DSV41 fan-out census: %zu distinct (name,degree) pairs with degree >= 2\n", census.size());
+        for (const auto & [key, n] : census) {
+            GGML_LOG_INFO("  fanout deg=%d  x%-4d  %s\n", key.second, n, key.first.c_str());
+        }
+    }
+
     // store {fork_idx, join_idx}
     std::vector<std::pair<int, int>> concurrent_node_ranges;
 
