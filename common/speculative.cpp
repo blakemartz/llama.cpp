@@ -1139,6 +1139,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (i_batch_beg[seq_id] > i_batch_end[seq_id]) {
                         continue;
                     }
+                    // a prefix-cache hit that ends before the replay start (a turn that appends more than
+                    // the window, e.g. a tool result) leaves the draft holding the previous turn's window:
+                    // the target ran only its encoder over the gap, so there are no features to fill it,
+                    // and llama_decode rejects the non-consecutive start. Restart the draft's window at
+                    // the replay start, exactly as a fresh prefill does.
+                    auto * mem_dft = llama_get_memory(ctx_dft);
+                    const llama_pos p_first     = batch_in.pos[i_batch_beg[seq_id]];
+                    const llama_pos dft_pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
+                    if (dft_pos_max >= 0 && dft_pos_max + 1 < p_first) {
+                        LOG_DBG("%s: seq %d: draft window ends at %d, replay starts at %d - restarting the draft window\n",
+                                __func__, seq_id, (int) dft_pos_max, (int) p_first);
+                        llama_memory_seq_rm(mem_dft, seq_id, -1, -1);
+                    }
                 }
             }
 
