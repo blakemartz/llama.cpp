@@ -1192,6 +1192,7 @@ struct llama_model_dots3note : public llama_model_base {
 };
 
 class llm_graph_input_dsv41;
+class llm_graph_input_dsv41_dec;
 
 struct llama_model_deepseek4 : public llama_model_base {
     llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
@@ -1342,12 +1343,23 @@ struct llama_model_deepseek4 : public llama_model_base {
 
         llm_graph_input_dsv41 * build_inp_dsv41() const;
 
+        // CED bounded replay: the subset of this ubatch's rows that run through the decoder, or nullptr
+        // when every row does (full-depth graph, unchanged)
+        llm_graph_input_dsv41_dec * build_inp_dsv41_dec(llm_graph_input_dsv41 * inp_full) const;
+
+        // inp_pub/cur_pub/pos_pub: at the decoder boundary the kv_source layer publishes its compressed K
+        // and indexer key from these (every token) while attending with inp/cur/inp_pos (the replayed
+        // rows); publish_only builds just that and returns nullptr.
         ggml_tensor * build_attention_v41(
                 const llama_model & model,
                 llm_graph_input_dsv41 * inp,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il,
+                const llm_graph_input_dsv41 * inp_pub = nullptr,
+                ggml_tensor * cur_pub = nullptr,
+                ggml_tensor * pos_pub = nullptr,
+                bool publish_only = false) const;
 
         // Engram: n-gram hash memory added into the hc residual stream (layers 1 and 14).
         // hashes: I32 [n_hash_cols, n_tokens] row ids into the layer's Q8_0 table.

@@ -3,6 +3,7 @@
 
 #include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-dsv41.h"
+#include "llama-ced.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -2038,12 +2039,19 @@ public:
         const auto * ctx_win  = mctx->get_win();
         const auto * ctx_comp = mctx->get_comp();
 
-        ctx_win->set_input_k_idxs(k_idxs_win, ubatch);
-        ctx_win->set_input_kq_mask(kq_mask_win, ubatch, cparams.causal_attn);
+        // an input that no node of this graph consumes is never allocated (CED bounded replay: a ubatch
+        // that ends at the encoder reads no ratio-1 compressed mask), so it has nothing to fill
+        auto live = [](const ggml_tensor * t) { return t != nullptr && t->buffer != nullptr; };
 
-        ctx_comp->set_input_k_idxs(k_idxs_comp, ubatch);
-        mctx->get_idx()->set_input_k_idxs(k_idxs_idx, ubatch);
-        ctx_comp->set_input_kq_mask(kq_mask_r1, ubatch, cparams.causal_attn);
+        if (live(k_idxs_win))  { ctx_win->set_input_k_idxs(k_idxs_win, ubatch); }
+        if (live(kq_mask_win)) { ctx_win->set_input_kq_mask(kq_mask_win, ubatch, cparams.causal_attn); }
+
+        if (live(k_idxs_comp)) { ctx_comp->set_input_k_idxs(k_idxs_comp, ubatch); }
+        if (live(k_idxs_idx))  { mctx->get_idx()->set_input_k_idxs(k_idxs_idx, ubatch); }
+        if (live(kq_mask_r1))  { ctx_comp->set_input_kq_mask(kq_mask_r1, ubatch, cparams.causal_attn); }
+        if (!live(k_idxs_comp) || !live(cell_prev) || !live(pos_grp) || !live(odd_f) || !live(kq_mask_r2)) {
+            return;
+        }
 
         const int64_t n_tokens = ubatch->n_tokens;
         GGML_ASSERT(kq_mask_r1->ne[3] == 1 && "V4.1: single stream");
@@ -2120,8 +2128,16 @@ public:
         res &= kq_mask_r1 ->ne[0] == (int64_t) mctx_new->get_comp()->get_n_kv();
         res &= kq_mask_win->ne[1] == n_tokens && kq_mask_win->ne[3] == 1;
         res &= kq_mask_r1 ->ne[1] == n_tokens && kq_mask_r1 ->ne[3] == 1;
+        // CED bounded replay: a graph built for the full-depth path cannot serve a ubatch that subsets
+        // the decoder rows, and vice versa
+        {
+            std::vector<int32_t> rows;
+            res &= llama_ced_dec_rows(params.cparams, params.ubatch, rows) == ced_subset;
+        }
         return res;
     }
+
+    bool ced_subset = false; // this graph subsets the decoder rows (see llm_graph_input_dsv41_dec)
 
     ggml_tensor * k_idxs_win  = nullptr; // I64 [n_tokens]
     ggml_tensor * kq_mask_win = nullptr; // F32/F16 [n_kv_win, n_tokens, 1, 1]
@@ -2138,6 +2154,126 @@ public:
     const llama_cparams cparams;
     const llama_kv_cache_dsv41_context * mctx;
 };
+
+// CED bounded replay (tech report 2.2 / 3.2.2): the rows of this ubatch that run through the decoder.
+// Under CED the decoder's global KV is projected from the encoder output at the decoder's kv_source layer,
+// so a prompt token needs the decoder only for its own window KV and its logits; the reference serving
+// replays the last n_win prompt tokens and stops everything else at the encoder. This input carries the
+// kept rows, their positions, their window-cache cells, the output ids remapped into the subset, and a
+// per-cell bias hiding window cells older than the replay start ("the same SWA truncation": replayed rows
+// see only replayed rows). The masks themselves are gathered in-graph from the full input's masks, so no
+// second [n_kv, n_tokens] mask is allocated. Only built when at least one row is dropped; a ubatch whose
+// rows all qualify keeps the unchanged full-depth graph.
+class llm_graph_input_dsv41_dec : public llm_graph_input_i {
+public:
+    llm_graph_input_dsv41_dec(const llama_cparams * cparams, const llama_kv_cache_dsv41_context * mctx,
+            const llm_graph_input_dsv41 * inp_full, uint32_t n_dec) :
+        cparams(cparams), mctx(mctx), inp_full(inp_full), n_dec(n_dec) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        std::vector<int32_t> r;
+        llama_ced_dec_rows(*cparams, *ubatch, r);
+        GGML_ASSERT(r.size() == n_dec && "CED bounded replay: the decoder row set changed under a reused graph");
+        if (n_dec == 0) {
+            return;   // the graph ended at the encoder: none of these tensors is consumed or allocated
+        }
+
+        // the full input precedes this one in the graph's input list, so its cells are already filled
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_full->k_idxs_win->buffer));
+        const int64_t * kw_full = (const int64_t *) inp_full->k_idxs_win->data;
+
+        std::vector<int32_t> p(n_dec);
+        std::vector<int64_t> kw(n_dec);
+        std::vector<int32_t> si((size_t) ubatch->n_tokens, 0);   // batch row -> index in the subset
+        for (uint32_t j = 0; j < n_dec; ++j) {
+            p [j] = ubatch->pos[r[j]];
+            kw[j] = kw_full[r[j]];
+            si[r[j]] = (int32_t) j;
+        }
+
+        ggml_backend_tensor_set(rows,       r.data(),  0, r.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(pos,        p.data(),  0, p.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(k_idxs_win, kw.data(), 0, kw.size()*sizeof(int64_t));
+        ggml_backend_tensor_set(sub_idx,    si.data(), 0, si.size()*sizeof(int32_t));
+
+        // hide window cells older than the replay start of the sequence they belong to
+        const int64_t n_kv = win_trunc->ne[0];
+        std::vector<float> tr((size_t) n_kv, 0.0f);
+        std::vector<llama_seq_id> seen;
+        for (uint32_t j = 0; j < n_dec; ++j) {
+            const llama_seq_id seq = ubatch->seq_id[r[j]][0];
+            if (std::find(seen.begin(), seen.end(), seq) != seen.end()) {
+                continue;
+            }
+            seen.push_back(seq);
+            const llama_pos from = (seq >= 0 && (size_t) seq < cparams->ced_replay_from.size()) ? cparams->ced_replay_from[seq] : -1;
+            if (from < 0) {
+                continue;
+            }
+            const auto & cells = mctx->get_win_cache()->get_cells(seq);
+            const int64_t n = std::min<int64_t>(n_kv, cells.size());
+            for (int64_t c = 0; c < n; ++c) {
+                if (!cells.is_empty(c) && cells.seq_has(c, seq) && cells.pos_get(c) < from) {
+                    tr[c] = -INFINITY;
+                }
+            }
+        }
+        ggml_backend_tensor_set(win_trunc, tr.data(), 0, tr.size()*sizeof(float));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        cparams = &params.cparams;
+        mctx    = static_cast<const llama_kv_cache_dsv41_context *>(params.mctx);
+        std::vector<int32_t> r;
+        if (!llama_ced_dec_rows(*cparams, params.ubatch, r) || r.size() != n_dec) {
+            return false;
+        }
+        return sub_idx->ne[0] == (int64_t) params.ubatch.n_tokens && win_trunc->ne[0] == (int64_t) mctx->get_win()->get_n_kv();
+    }
+
+    ggml_tensor * rows       = nullptr; // I32 [n_dec]    ubatch row of each kept token
+    ggml_tensor * pos        = nullptr; // I32 [n_dec]    its position
+    ggml_tensor * sub_idx    = nullptr; // I32 [n_tokens] batch row -> index in the subset (remaps the output ids)
+    ggml_tensor * k_idxs_win = nullptr; // I64 [n_dec]    its window-cache cell
+    ggml_tensor * win_trunc  = nullptr; // F32 [n_kv_win] 0 or -inf per window cell
+
+    const llama_cparams * cparams;
+    const llama_kv_cache_dsv41_context * mctx;
+    const llm_graph_input_dsv41 * inp_full;
+    const uint32_t n_dec;
+};
+
+llm_graph_input_dsv41_dec * llama_model_deepseek4::graph_v41::build_inp_dsv41_dec(llm_graph_input_dsv41 * inp_full) const {
+    std::vector<int32_t> rows;
+    if (!llama_ced_dec_rows(cparams, ubatch, rows)) {
+        return nullptr;
+    }
+    const auto * mctx_cur = static_cast<const llama_kv_cache_dsv41_context *>(mctx);
+
+    uint32_t n_out = 0;
+    for (int32_t r : rows) {
+        if (ubatch.output && ubatch.output[r]) {
+            ++n_out;
+        }
+    }
+    GGML_ASSERT(n_out == n_outputs && "CED bounded replay: an output row is not in the decoder subset");
+
+    auto inp = std::make_unique<llm_graph_input_dsv41_dec>(&cparams, mctx_cur, inp_full, (uint32_t) rows.size());
+    auto vec = [&](ggml_type type, int64_t ne0) {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx0, type, ne0);
+        ggml_set_input(t);
+        return t;
+    };
+    inp->rows       = vec(GGML_TYPE_I32, (int64_t) rows.size());
+    inp->pos        = vec(GGML_TYPE_I32, (int64_t) rows.size());
+    inp->sub_idx    = vec(GGML_TYPE_I32, (int64_t) n_tokens);
+    inp->k_idxs_win = vec(GGML_TYPE_I64, (int64_t) rows.size());
+    inp->win_trunc  = vec(GGML_TYPE_F32, (int64_t) mctx_cur->get_win()->get_n_kv());
+
+    inp_full->ced_subset = true;
+
+    return (llm_graph_input_dsv41_dec *) res->add_input(std::move(inp));
+}
 
 llm_graph_input_dsv41 * llama_model_deepseek4::graph_v41::build_inp_dsv41() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv41_context *>(mctx);
@@ -2283,7 +2419,11 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
         llm_graph_input_dsv41 * inp,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) const {
+        int il,
+        const llm_graph_input_dsv41 * inp_pub,
+        ggml_tensor * cur_pub,
+        ggml_tensor * pos_pub,
+        bool publish_only) const {
     const auto & layer = model.layers[il];
 
     const int64_t n_embd_head      = hparams.n_embd_head_k();
@@ -2298,6 +2438,15 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
     GGML_ASSERT(n_embd_head == n_embd_head_v);
     GGML_ASSERT(n_head % n_groups == 0);
 
+    // CED bounded replay: at the decoder boundary the kv_source layer publishes its compressed K and
+    // indexer key for EVERY token of the ubatch (they are the decoder's global KV, projected from the
+    // encoder output) while its own attention runs on the replayed rows only. The publish inputs default
+    // to the attention inputs, which is the plain full-depth graph.
+    if (!inp_pub) { inp_pub = inp; }
+    if (!cur_pub) { cur_pub = cur; }
+    if (!pos_pub) { pos_pub = inp_pos; }
+    const int64_t nt_pub = cur_pub->ne[1];
+
     // compress layers rope with the compress base + YaRN; pure window layers use the base theta, no YaRN
     const bool use_compress_rope = hparams.dsv4_compress_ratios[il] != 0;
     const float freq_base_l      = use_compress_rope ? hparams.dsv4_compress_rope_base : freq_base;
@@ -2307,6 +2456,95 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
     const float beta_fast_l      = use_compress_rope ? beta_fast : 0.0f;
     const float beta_slow_l      = use_compress_rope ? beta_slow : 0.0f;
     const int32_t n_ctx_orig_l   = use_compress_rope ? n_ctx_orig : 0;
+
+    const float   kq_scale = 1.0f/sqrtf(float(n_embd_head));
+    const int64_t ratio    = hparams.dsv4_compress_ratios[il];
+
+    const auto * ctx_win  = inp->mctx->get_win();
+    const auto * ctx_comp = inp->mctx->get_comp();
+    const auto * ctx_idx  = inp->mctx->get_idx();
+
+    auto rope = [&](ggml_tensor * t, ggml_tensor * pos) {
+        t = ggml_rope_ext(ctx0, t, pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+        return ggml_rope_set_offset(t, n_embd_head_nope);
+    };
+
+    if (ratio != 0) {
+        if (hparams.is_kv_source_impl[il]) {
+            ggml_tensor * comp = nullptr;
+            ggml_tensor * comp_pre = nullptr;   // normed compressed latent, before RoPE  [n_embd_head, nt_pub]
+            ggml_tensor * comp_pos = nullptr;   // the positions comp was roped at
+            if (ratio == 1) {
+                comp = build_lora_mm(layer.attn_comp_wkv, cur_pub);                                    // [n_embd_head, nt_pub]
+                comp = build_norm(comp, layer.attn_comp_norm, nullptr, LLM_NORM_RMS, il);
+                comp_pre = comp;
+                comp_pos = pos_pub;
+                comp = rope(ggml_reshape_3d(ctx0, comp, n_embd_head, 1, nt_pub), pos_pub);
+            } else {
+                GGML_ASSERT(ratio == 2);
+                ggml_tensor * ckv = build_lora_mm(layer.attn_comp_wkv,   cur_pub);                     // [n_embd_head, nt_pub]
+                ggml_tensor * csc = build_lora_mm(layer.attn_comp_wgate, cur_pub);
+                cb(ckv, "ced_raw_kv", il);
+                cb(csc, "ced_raw_gate", il);
+
+                // every token parks its raw projections in its own cell first (K = wkv, V = wgate) --
+                // an unpaired even token keeps them there until its partner arrives
+                ggml_build_forward_expand(gf, ctx_comp->cpy_k(ctx0, ggml_reshape_3d(ctx0, ckv, n_embd_head, 1, nt_pub), inp_pub->k_idxs_comp, il));
+                ggml_build_forward_expand(gf, ctx_comp->cpy_v(ctx0, ggml_reshape_3d(ctx0, csc, n_embd_head, 1, nt_pub), inp_pub->k_idxs_comp, il));
+
+                // the partner's parked projections (for even tokens: its own -- discarded below)
+                ggml_tensor * k_view = ctx_comp->get_k(ctx0, il);
+                ggml_tensor * v_view = ctx_comp->get_v(ctx0, il);
+                k_view = ggml_view_2d(ctx0, k_view, n_embd_head, k_view->ne[2], k_view->nb[2], 0);
+                v_view = ggml_view_2d(ctx0, v_view, n_embd_head, v_view->ne[2], v_view->nb[2], 0);
+                ggml_tensor * pkv = ggml_get_rows(ctx0, k_view, inp_pub->cell_prev);                   // [n_embd_head, nt_pub] f32
+                ggml_tensor * psc = ggml_get_rows(ctx0, v_view, inp_pub->cell_prev);
+
+                ggml_tensor * values = ggml_concat(ctx0, ggml_reshape_3d(ctx0, pkv, n_embd_head, 1, nt_pub),
+                                                         ggml_reshape_3d(ctx0, ckv, n_embd_head, 1, nt_pub), 1); // [n_embd_head, 2, nt_pub]
+                ggml_tensor * scores = ggml_concat(ctx0, ggml_reshape_3d(ctx0, psc, n_embd_head, 1, nt_pub),
+                                                         ggml_reshape_3d(ctx0, csc, n_embd_head, 1, nt_pub), 1);
+                values = ggml_cont(ctx0, ggml_permute(ctx0, values, 1, 0, 2, 3));                  // [2, n_embd_head, nt_pub]
+                scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3));
+                ggml_tensor * w = ggml_soft_max(ctx0, scores);                                     // over the group members
+                comp = ggml_sum_rows(ctx0, ggml_mul(ctx0, values, w));                             // [1, n_embd_head, nt_pub]
+                comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));                      // [n_embd_head, 1, nt_pub]
+                comp = ggml_reshape_2d(ctx0, comp, n_embd_head, nt_pub);
+                comp = build_norm(comp, layer.attn_comp_norm, nullptr, LLM_NORM_RMS, il);
+                comp_pre = comp;
+                comp_pos = inp_pub->pos_grp;
+                comp = rope(ggml_reshape_3d(ctx0, comp, n_embd_head, 1, nt_pub), inp_pub->pos_grp);
+
+                // odd tokens store the group K at their cell; even tokens keep their parked raw wkv
+                ggml_tensor * odd  = ggml_reshape_3d(ctx0, inp_pub->odd_f, 1, 1, nt_pub);
+                ggml_tensor * even = ggml_scale_bias(ctx0, odd, -1.0f, 1.0f);
+                ggml_tensor * raw  = ggml_reshape_3d(ctx0, ckv, n_embd_head, 1, nt_pub);
+                comp = ggml_add(ctx0, ggml_mul(ctx0, comp, odd), ggml_mul(ctx0, raw, even));
+            }
+            cb(comp, "ced_k", il);
+            ggml_build_forward_expand(gf, ctx_comp->cpy_k(ctx0, comp, inp_pub->k_idxs_comp, il));
+
+            // A CSA2-Full layer also publishes the indexer key for the same cell, so the layers in its
+            // group can score against it. Roped at the same positions as the compressed K it describes,
+            // so the indexer's q.k is in one rotational frame (no folded-rotation trick needed here).
+            if (layer.indexer_attn_k) {
+                const int64_t idx_head = hparams.indexer_head_size;
+                ggml_tensor * kidx = build_lora_mm(layer.indexer_attn_k, comp_pre);                // [idx_head, nt_pub]
+                kidx = build_norm(kidx, layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
+                kidx = ggml_reshape_3d(ctx0, kidx, idx_head, 1, nt_pub);
+                kidx = ggml_rope_ext(ctx0, kidx, comp_pos, nullptr, n_embd_head_rope, rope_type,
+                        n_ctx_orig_l, freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l,
+                        beta_fast_l, beta_slow_l);
+                kidx = ggml_rope_set_offset(kidx, idx_head - n_embd_head_rope);
+                cb(kidx, "csa2_idx_k", il);
+                ggml_build_forward_expand(gf, ctx_idx->cpy_k(ctx0, kidx, inp_pub->k_idxs_idx, il));
+            }
+        }
+    }
+    if (publish_only) {
+        return nullptr;
+    }
 
     ggml_tensor * qr = build_lora_mm(layer.wq_a, cur);
     cb(qr, "qr", il);
@@ -2332,19 +2570,6 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
     kv = ggml_rope_set_offset(kv, n_embd_head_nope);
     cb(kv, "kv", il);
 
-    const float   kq_scale = 1.0f/sqrtf(float(n_embd_head));
-    const int64_t ratio    = hparams.dsv4_compress_ratios[il];
-
-    const auto * ctx_win  = inp->mctx->get_win();
-    const auto * ctx_comp = inp->mctx->get_comp();
-    const auto * ctx_idx  = inp->mctx->get_idx();
-
-    auto rope = [&](ggml_tensor * t, ggml_tensor * pos) {
-        t = ggml_rope_ext(ctx0, t, pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
-                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
-        return ggml_rope_set_offset(t, n_embd_head_nope);
-    };
-
     // window K through the window cache exactly as build_attn does it: K = V = the single shared kv head
     GGML_ASSERT(hparams.is_swa(il));
     ggml_build_forward_expand(gf, q);
@@ -2355,81 +2580,6 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
     GGML_ASSERT(k_all->ne[3] == 1 && "V4.1: single stream");
 
     if (ratio != 0) {
-        // kv_source layers compress their own KV for their CED group into the compressed cache: the
-        // reference Compressor -- ratio 1 = plain wkv + norm; ratio 2 = softmax(wgate)-weighted pool of
-        // each group of 2 tokens, norm -- then RoPE at the group position. The normed, pre-RoPE latent
-        // (comp_pre) is what the indexer's key projection consumes.
-        if (hparams.is_kv_source_impl[il]) {
-            ggml_tensor * comp = nullptr;
-            ggml_tensor * comp_pre = nullptr;   // normed compressed latent, before RoPE  [n_embd_head, nt]
-            ggml_tensor * comp_pos = nullptr;   // the positions comp was roped at
-            if (ratio == 1) {
-                comp = build_lora_mm(layer.attn_comp_wkv, cur);                                    // [n_embd_head, nt]
-                comp = build_norm(comp, layer.attn_comp_norm, nullptr, LLM_NORM_RMS, il);
-                comp_pre = comp;
-                comp_pos = inp_pos;
-                comp = rope(ggml_reshape_3d(ctx0, comp, n_embd_head, 1, nt), inp_pos);
-            } else {
-                GGML_ASSERT(ratio == 2);
-                ggml_tensor * ckv = build_lora_mm(layer.attn_comp_wkv,   cur);                     // [n_embd_head, nt]
-                ggml_tensor * csc = build_lora_mm(layer.attn_comp_wgate, cur);
-                cb(ckv, "ced_raw_kv", il);
-                cb(csc, "ced_raw_gate", il);
-
-                // every token parks its raw projections in its own cell first (K = wkv, V = wgate) --
-                // an unpaired even token keeps them there until its partner arrives
-                ggml_build_forward_expand(gf, ctx_comp->cpy_k(ctx0, ggml_reshape_3d(ctx0, ckv, n_embd_head, 1, nt), inp->k_idxs_comp, il));
-                ggml_build_forward_expand(gf, ctx_comp->cpy_v(ctx0, ggml_reshape_3d(ctx0, csc, n_embd_head, 1, nt), inp->k_idxs_comp, il));
-
-                // the partner's parked projections (for even tokens: its own -- discarded below)
-                ggml_tensor * k_view = ctx_comp->get_k(ctx0, il);
-                ggml_tensor * v_view = ctx_comp->get_v(ctx0, il);
-                k_view = ggml_view_2d(ctx0, k_view, n_embd_head, k_view->ne[2], k_view->nb[2], 0);
-                v_view = ggml_view_2d(ctx0, v_view, n_embd_head, v_view->ne[2], v_view->nb[2], 0);
-                ggml_tensor * pkv = ggml_get_rows(ctx0, k_view, inp->cell_prev);                   // [n_embd_head, nt] f32
-                ggml_tensor * psc = ggml_get_rows(ctx0, v_view, inp->cell_prev);
-
-                ggml_tensor * values = ggml_concat(ctx0, ggml_reshape_3d(ctx0, pkv, n_embd_head, 1, nt),
-                                                         ggml_reshape_3d(ctx0, ckv, n_embd_head, 1, nt), 1); // [n_embd_head, 2, nt]
-                ggml_tensor * scores = ggml_concat(ctx0, ggml_reshape_3d(ctx0, psc, n_embd_head, 1, nt),
-                                                         ggml_reshape_3d(ctx0, csc, n_embd_head, 1, nt), 1);
-                values = ggml_cont(ctx0, ggml_permute(ctx0, values, 1, 0, 2, 3));                  // [2, n_embd_head, nt]
-                scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3));
-                ggml_tensor * w = ggml_soft_max(ctx0, scores);                                     // over the group members
-                comp = ggml_sum_rows(ctx0, ggml_mul(ctx0, values, w));                             // [1, n_embd_head, nt]
-                comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));                      // [n_embd_head, 1, nt]
-                comp = ggml_reshape_2d(ctx0, comp, n_embd_head, nt);
-                comp = build_norm(comp, layer.attn_comp_norm, nullptr, LLM_NORM_RMS, il);
-                comp_pre = comp;
-                comp_pos = inp->pos_grp;
-                comp = rope(ggml_reshape_3d(ctx0, comp, n_embd_head, 1, nt), inp->pos_grp);
-
-                // odd tokens store the group K at their cell; even tokens keep their parked raw wkv
-                ggml_tensor * odd  = ggml_reshape_3d(ctx0, inp->odd_f, 1, 1, nt);
-                ggml_tensor * even = ggml_scale_bias(ctx0, odd, -1.0f, 1.0f);
-                ggml_tensor * raw  = ggml_reshape_3d(ctx0, ckv, n_embd_head, 1, nt);
-                comp = ggml_add(ctx0, ggml_mul(ctx0, comp, odd), ggml_mul(ctx0, raw, even));
-            }
-            cb(comp, "ced_k", il);
-            ggml_build_forward_expand(gf, ctx_comp->cpy_k(ctx0, comp, inp->k_idxs_comp, il));
-
-            // A CSA2-Full layer also publishes the indexer key for the same cell, so the layers in its
-            // group can score against it. Roped at the same positions as the compressed K it describes,
-            // so the indexer's q.k is in one rotational frame (no folded-rotation trick needed here).
-            if (layer.indexer_attn_k) {
-                const int64_t idx_head = hparams.indexer_head_size;
-                ggml_tensor * kidx = build_lora_mm(layer.indexer_attn_k, comp_pre);                // [idx_head, nt]
-                kidx = build_norm(kidx, layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
-                kidx = ggml_reshape_3d(ctx0, kidx, idx_head, 1, nt);
-                kidx = ggml_rope_ext(ctx0, kidx, comp_pos, nullptr, n_embd_head_rope, rope_type,
-                        n_ctx_orig_l, freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l,
-                        beta_fast_l, beta_slow_l);
-                kidx = ggml_rope_set_offset(kidx, idx_head - n_embd_head_rope);
-                cb(kidx, "csa2_idx_k", il);
-                ggml_build_forward_expand(gf, ctx_idx->cpy_k(ctx0, kidx, inp->k_idxs_idx, il));
-            }
-        }
-
         // ONE softmax over [window ; compressed] with the sinks (the reference sparse_attn over
         // cat([kv, compress_kv])); the compressed K comes from the CED source layer's cache
         const int src = ced_src[il];
@@ -2543,8 +2693,65 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
         ced_src[il] = src;
     }
 
+    // CED bounded replay: the decoder starts at its kv_source layer (the last one). That layer's
+    // compressor and indexer key publish the encoder output for every token; its own attention and FFN,
+    // and every layer after it, run only on the replayed rows. inp_attn_dec is the subset view of the
+    // attention inputs: window cells from the dec input, masks gathered in-graph from the full masks.
+    int il_dec = -1;
+    for (int il = 0; il < n_layer; ++il) {
+        if (hparams.is_kv_source_impl[il]) { il_dec = il; }
+    }
+    llm_graph_input_dsv41_dec * inp_dec = il_dec > 0 ? build_inp_dsv41_dec(inp_attn) : nullptr;
+    const bool    dec_subset = inp_dec != nullptr;
+    const int64_t n_dec      = dec_subset ? inp_dec->n_dec : n_tokens;
+    bool          dec_ended  = false;   // every row stopped at the encoder: no decoder, no head
+
+    llm_graph_input_dsv41 inp_attn_dec(cparams, static_cast<const llama_kv_cache_dsv41_context *>(mctx));
+    if (dec_subset && n_dec > 0) {
+        const ggml_type mtype = inp_attn->kq_mask_win->type;
+        ggml_tensor * mw = ggml_get_rows(ctx0, inp_attn->kq_mask_win, inp_dec->rows);   // F32 [n_kv_win, n_dec]
+        mw = ggml_add(ctx0, mw, inp_dec->win_trunc);
+        ggml_tensor * m1 = ggml_get_rows(ctx0, inp_attn->kq_mask_r1, inp_dec->rows);    // F32 [n_kv_comp, n_dec]
+        if (mtype != GGML_TYPE_F32) {
+            mw = ggml_cast(ctx0, mw, mtype);
+            m1 = ggml_cast(ctx0, m1, mtype);
+        }
+        cb(mw, "ced_kq_mask_win", il_dec);
+        cb(m1, "ced_kq_mask_r1",  il_dec);
+        inp_attn_dec.k_idxs_win  = inp_dec->k_idxs_win;
+        inp_attn_dec.kq_mask_win = mw;
+        inp_attn_dec.kq_mask_r1  = m1;
+    }
+    const llm_graph_input_dsv41 * pub_inp = nullptr;
+    ggml_tensor * pub_cur = nullptr;
+    ggml_tensor * pub_pos = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
+
+        ggml_tensor * cur_pre = nullptr;   // the attention input, when already built at the CED boundary
+        if (dec_subset && il == il_dec) {
+            ggml_tensor * cur_full = build_hc_pre(inpL, pre_mix, il);
+            cur_full = build_norm(cur_full, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur_full, "attn_norm_full", il);
+            if (n_dec == 0) {
+                build_attention_v41(model, inp_attn, cur_full, inp_pos, il, nullptr, nullptr, nullptr, /*publish_only*/ true);
+                dec_ended = true;
+                break;
+            }
+            pub_inp = inp_attn;
+            pub_cur = cur_full;
+            pub_pos = inp_pos;
+
+            // from here on the graph carries only the replayed rows
+            ggml_tensor * flat_full = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+            inpL    = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat_full, inp_dec->rows), n_embd, hc, n_dec);
+            pre_mix = ggml_get_rows(ctx0, pre_mix, inp_dec->rows);
+            cur_pre = ggml_get_rows(ctx0, cur_full, inp_dec->rows);
+            cb(inpL, "ced_dec_rows", il);
+            inp_pos  = inp_dec->pos;
+            inp_attn = &inp_attn_dec;
+        }
 
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
@@ -2563,13 +2770,20 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
                 &attn_pre, &attn_post, &attn_comb, il);
 
         cb(pre_mix, "hc_pre_mix", il);                 // the gates themselves, for the oracle diff
-        cur = build_hc_pre(inpL, pre_mix, il);          // the previous sublayer's mix
-        cb(cur, "hc_attn_pre", il);
+        if (cur_pre) {
+            cur = cur_pre;                              // built in full at the CED boundary, then subset
+        } else {
+            cur = build_hc_pre(inpL, pre_mix, il);      // the previous sublayer's mix
+            cb(cur, "hc_attn_pre", il);
 
-        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+            cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+        }
         cb(cur, "attn_norm", il);
 
-        cur = build_attention_v41(model, inp_attn, cur, inp_pos, il);
+        cur = build_attention_v41(model, inp_attn, cur, inp_pos, il, pub_inp, pub_cur, pub_pos);
+        pub_inp = nullptr;
+        pub_cur = nullptr;
+        pub_pos = nullptr;
 
         inpL = build_hc_post(cur, residual, attn_post, attn_comb, il);
         cb(inpL, "hc_attn_post", il);
@@ -2619,13 +2833,28 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
         pre_mix = ffn_pre;                              // threaded to the next layer's attention
     }
 
+    if (dec_ended) {
+        // CED bounded replay: every row of this ubatch stopped at the encoder. The compressed K and the
+        // indexer key it published are the only outputs; there are no logits (n_outputs is 0 here).
+        GGML_ASSERT(n_outputs == 0);
+        return;
+    }
+
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
         res->t_layer_inp[n_layer] = dsv4_hc_mean(ctx0, inpL);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
 
-    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+    if (dec_subset && inp_out_ids) {
+        // the output rows, as indices into the decoder subset (keeps the original input consumed).
+        // get_rows gathers ROWS of its source, so the index vector is viewed as [1, n_tokens].
+        ggml_tensor * sub_idx = ggml_reshape_2d(ctx0, inp_dec->sub_idx, 1, n_tokens);
+        inp_out_ids = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, sub_idx, inp_out_ids), n_outputs);
+        cb(inp_out_ids, "ced_out_ids", -1);
+    }
+
+    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, inpL->ne[2]);
     ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
 
     if (cparams.embeddings_nextn) {

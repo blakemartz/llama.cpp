@@ -116,6 +116,15 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// DeepSeek-V4.1 CED bounded replay (tech report 2.2 / 3.2.2). The window (in tokens) is fixed at context
+// creation from DSV41_CED_REPLAY_WINDOW; 0 means the feature is off and every prompt token runs the full
+// depth. With it on, the caller sets, per sequence, the first prompt position that runs through the
+// decoder (normally n_prompt_positions - window, clamped at 0); rows below it stop after the encoder and
+// carry no logits and no per-layer extraction. -1 restores the full-depth behaviour for that sequence.
+LLAMA_API uint32_t  llama_ced_replay_window(const struct llama_context * ctx);
+LLAMA_API void      llama_set_ced_replay   (struct llama_context * ctx, llama_seq_id seq_id, llama_pos replay_from);
+LLAMA_API llama_pos llama_ced_replay_from  (const struct llama_context * ctx, llama_seq_id seq_id);
+
 //
 // model/context data extraction
 //

@@ -201,6 +201,12 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_tokens = ubatch->n_tokens;
 
+    // a graph that ends at the encoder (DeepSeek-V4.1 CED bounded replay) has no consumer for the output
+    // ids, so the allocator never gave them a buffer and there is nothing to fill
+    if (out_ids->buffer == nullptr && cparams.ced_replay_window > 0) {
+        return;
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
     int32_t * data = (int32_t *) out_ids->data;
 
@@ -1376,6 +1382,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
+                // a V4.1 ubatch that ends at the encoder (CED bounded replay) builds no decoder layers,
+                // so a tap on one of them has nothing to output for this ubatch
+                if (t_layer_inp[il] == nullptr && params.cparams.ced_replay_window > 0) {
+                    continue;
+                }
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
             }

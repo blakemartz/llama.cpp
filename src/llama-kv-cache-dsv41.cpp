@@ -267,7 +267,8 @@ llama_kv_cache_dsv41_context::llama_kv_cache_dsv41_context(
     ctx_comp(kv->get_comp()->init_full()),
     ctx_idx (kv->get_idx ()->init_full()),
     status(llama_memory_status_combine(llama_memory_status_combine(ctx_win->get_status(), ctx_comp->get_status()), ctx_idx->get_status())),
-    kv_comp(kv->get_comp()) {
+    kv_comp(kv->get_comp()),
+    kv_win (kv->get_win ()) {
 }
 
 llama_kv_cache_dsv41_context::llama_kv_cache_dsv41_context(
@@ -278,7 +279,8 @@ llama_kv_cache_dsv41_context::llama_kv_cache_dsv41_context(
     ctx_comp(kv->get_comp()->init_update(lctx, optimize)),
     ctx_idx (kv->get_idx ()->init_update(lctx, optimize)),
     status(llama_memory_status_combine(llama_memory_status_combine(ctx_win->get_status(), ctx_comp->get_status()), ctx_idx->get_status())),
-    kv_comp(kv->get_comp()) {
+    kv_comp(kv->get_comp()),
+    kv_win (kv->get_win ()) {
 }
 
 llama_kv_cache_dsv41_context::llama_kv_cache_dsv41_context(
@@ -292,7 +294,8 @@ llama_kv_cache_dsv41_context::llama_kv_cache_dsv41_context(
     ctx_comp(new llama_kv_cache_context(kv->get_comp(), std::move(sinfos_comp), this->ubatches)),
     ctx_idx (new llama_kv_cache_context(kv->get_idx (), std::move(sinfos_idx),  this->ubatches)),
     status(llama_memory_status_combine(llama_memory_status_combine(ctx_win->get_status(), ctx_comp->get_status()), ctx_idx->get_status())),
-    kv_comp(kv->get_comp()) {
+    kv_comp(kv->get_comp()),
+    kv_win (kv->get_win ()) {
 }
 
 llama_kv_cache_dsv41_context::~llama_kv_cache_dsv41_context() = default;

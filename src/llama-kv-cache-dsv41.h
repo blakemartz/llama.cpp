@@ -100,6 +100,9 @@ public:
 
     // the compressed cache itself, for cell -> position lookups when building the group masks
     const llama_kv_cache * get_comp_cache() const { return kv_comp; }
+    // the window cache itself, for cell -> position lookups (CED bounded replay hides window cells older
+    // than the replay start from the replayed rows)
+    const llama_kv_cache * get_win_cache() const { return kv_win; }
 
 private:
     size_t i_next = 0;
@@ -113,4 +116,5 @@ private:
     const llama_memory_status status;
 
     const llama_kv_cache * kv_comp = nullptr;
+    const llama_kv_cache * kv_win  = nullptr;
 };

@@ -116,6 +116,11 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+
+    // CED bounded replay (see llama-ced.h)
+    uint32_t  ced_replay_window() const { return cparams.ced_replay_window; }
+    void      set_ced_replay(llama_seq_id seq_id, llama_pos replay_from);
+    llama_pos ced_replay_from(llama_seq_id seq_id) const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -233,7 +238,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(const llm_graph_result * res, const llama_ubatch & ubatch, size_t token_offset);
 
     //
     // graph

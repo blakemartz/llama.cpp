@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "../../src/llama-ext.h"   // CED bounded replay: llama_ced_replay_window / llama_set_ced_replay
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -3291,6 +3292,22 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                            }
+
+                            // CED bounded replay (DeepSeek-V4.1): only the last n_win prompt positions run
+                            // through the decoder, and their encoder outputs are not cached, so a cache hit
+                            // inside that window backs up to re-encode it. Positions, not token indices,
+                            // because media chunks span several positions. Done before the checkpoint
+                            // logic below so it validates the lowered n_past.
+                            if (const uint32_t n_win = llama_ced_replay_window(ctx_tgt); n_win > 0) {
+                                const llama_pos pos_end  = slot.task->tokens.pos_next();
+                                const llama_pos ced_from = std::max<llama_pos>(0, pos_end - (llama_pos) n_win);
+                                const int n_past_max = (int) slot.task->tokens.size_up_to_pos(ced_from);
+                                if (n_past > n_past_max) {
+                                    SLT_DBG(slot, "CED replay: n_past %d -> %d so the last %u positions are re-encoded\n", n_past, n_past_max, n_win);
+                                    n_past = n_past_max;
+                                }
+                                llama_set_ced_replay(ctx_tgt, slot.id, ced_from);
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);

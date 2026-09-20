@@ -56,6 +56,15 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
+    // DeepSeek-V4.1 CED bounded replay (tech report 2.2 / 3.2.2): during prefill only the last
+    // ced_replay_window prompt tokens (plus every output row) run through the decoder, i.e. the layers
+    // from the decoder's kv_source on; the rest stop after the encoder. Set from the environment
+    // (DSV41_CED_REPLAY_WINDOW) at context creation so the graph shape is decided before the reserve;
+    // 0 = off and the graphs are byte-identical to before. ced_replay_from[seq] is the first prompt
+    // position of the replayed window, -1 = every row of that sequence goes through the decoder.
+    uint32_t ced_replay_window = 0;
+    std::vector<llama_pos> ced_replay_from; // [n_seq_max]
+
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

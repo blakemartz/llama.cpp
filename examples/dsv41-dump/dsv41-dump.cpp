@@ -9,6 +9,10 @@
 //   DSV41_DUMP_ALL_LOGITS=1  request logits for every token: result_output becomes [n_vocab, n_tokens_ub]
 //                            instead of the last token only.
 //   DSV41_FORCE_BOS=1        prepend BOS even if the GGUF tokenizer metadata says not to.
+//   DSV41_DUMP_CONT=K        continuation mode: decode the first n-K tokens as a prompt (no logits, nothing
+//                            dumped), then decode the last K tokens in one batch and dump those. With
+//                            DSV41_CED_REPLAY_WINDOW set the prompt runs under CED bounded replay, so the
+//                            K continuation logits measure that approximation ("continuation KLD").
 //   DSV41_DUMP_UB_MARKER     regex of a once-per-graph node NAME marking a ubatch start (default: structural
 //                            match of the token-embedding GET_ROWS node, see below).
 //
@@ -28,7 +32,9 @@
 #include "llama.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "../../src/llama-ext.h"   // llama_ced_replay_window / llama_set_ced_replay (continuation mode)
 
+#include <algorithm>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
@@ -46,6 +52,7 @@ struct dump_state {
     bool          marker_by_name = false;
     bool          marker_seen = false;
     bool          fallback_warned = false;
+    bool          disabled  = false;   // continuation mode: the prefill decode writes nothing
     int           ub_ntok   = 0;   // tokens in the current ubatch (from the marker's ne[1])
     int           tok0      = 0;   // first token of the current ubatch
     int           next_tok0 = 0;
@@ -113,6 +120,9 @@ static bool dsv41_is_marker(const dump_state * st, const ggml_tensor * t) {
 }
 
 static bool dsv41_dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    if (((dump_state *) user_data)->disabled) {
+        return false;
+    }
     auto * st = (dump_state *) user_data;
     const bool match = std::regex_match(t->name, st->filter);
     if (ask) {
@@ -279,8 +289,51 @@ int main(int argc, char ** argv) {
     LOG_INF("dsv41-dump: %zu tokens (add_bos=%d), n_ubatch=%d -> %d ubatch(es), all_logits=%d, dumping to %s with filter %s\n",
             tokens.size(), (int) add_bos, st.n_ubatch, st.n_ub, (int) all_logits, st.outdir.c_str(), flt ? flt : "(default)");
 
-    llama_batch batch = llama_batch_init((int32_t) tokens.size(), 0, 1);
-    for (size_t i = 0; i < tokens.size(); ++i) {
+    // continuation mode: prefill first, silently, then dump only the last n_cont tokens
+    size_t tok_first = 0;
+    {
+        const char * c = std::getenv("DSV41_DUMP_CONT");
+        const int n_cont = c ? atoi(c) : 0;
+        if (n_cont > 0) {
+            if ((size_t) n_cont >= tokens.size()) {
+                LOG_ERR("dsv41-dump: DSV41_DUMP_CONT=%d must be smaller than the %zu prompt tokens\n", n_cont, tokens.size());
+                return 1;
+            }
+            const size_t n_pre = tokens.size() - (size_t) n_cont;
+            if (const uint32_t n_win = llama_ced_replay_window(ctx); n_win > 0) {
+                const llama_pos from = std::max<llama_pos>(0, (llama_pos) n_pre - (llama_pos) n_win);
+                llama_set_ced_replay(ctx, 0, from);
+                LOG_INF("dsv41-dump: CED bounded replay, window %u: prompt positions >= %d run through the decoder\n", n_win, from);
+            }
+            st.disabled = true;
+            llama_batch pre = llama_batch_init((int32_t) n_pre, 0, 1);
+            for (size_t i = 0; i < n_pre; ++i) {
+                common_batch_add(pre, tokens[i], (llama_pos) i, { 0 }, false);
+            }
+            const int rc_pre = llama_decode(ctx, pre);
+            llama_batch_free(pre);
+            if (rc_pre) {
+                LOG_ERR("prefill decode failed (%d)\n", rc_pre);
+                return 1;
+            }
+            st.disabled = false;
+            // the continuation is dumped as if it were the whole prompt
+            tok_first     = n_pre;
+            st.n_tokens   = n_cont;
+            st.n_ub       = (n_cont + st.n_ubatch - 1) / st.n_ubatch;
+            st.ub         = 0;
+            st.marker_seen = false;
+            st.next_tok0  = 0;
+            st.tok0       = 0;
+            st.seen.clear();
+            std::ofstream tf(st.outdir + "/tokens.txt");
+            for (size_t i = n_pre; i < tokens.size(); ++i) { tf << tokens[i] << "\n"; }
+            LOG_INF("dsv41-dump: continuation mode: %zu prompt tokens prefilled, dumping the last %d\n", n_pre, n_cont);
+        }
+    }
+
+    llama_batch batch = llama_batch_init((int32_t) (tokens.size() - tok_first), 0, 1);
+    for (size_t i = tok_first; i < tokens.size(); ++i) {
         common_batch_add(batch, tokens[i], (llama_pos) i, { 0 }, all_logits || i + 1 == tokens.size());
     }
     const int rc = llama_decode(ctx, batch);

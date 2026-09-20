@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-ced.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -97,6 +98,12 @@ llama_context::llama_context(
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+
+    // DeepSeek-V4.1 CED bounded replay: decided here so graph_reserve sees the final graph shape
+    if (const char * e = getenv("DSV41_CED_REPLAY_WINDOW")) {
+        cparams.ced_replay_window = (uint32_t) std::max(0, atoi(e));
+    }
+    cparams.ced_replay_from.assign(cparams.n_seq_max, -1);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
@@ -1989,7 +1996,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        extract_layer_inputs(res, ubatch, n_tokens_prev);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2246,7 +2253,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+void llama_context::extract_layer_inputs(const llm_graph_result * res, const llama_ubatch & ubatch, size_t token_offset) {
+    const size_t n_tokens = ubatch.n_tokens;
+
+    // CED bounded replay: the tapped tensors hold only the rows that ran through the decoder, which are
+    // scattered back to their batch rows below; a ubatch that ended at the encoder has nothing to extract
+    std::vector<int32_t> dec_rows;
+    const bool dec_subset = llama_ced_dec_rows(cparams, ubatch, dec_rows);
+
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -2256,21 +2270,42 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         }
         ggml_tensor * t = res->get_layer_inp((int) il);
         if (!t) {
+            if (dec_subset && dec_rows.empty()) {
+                continue;
+            }
             GGML_ABORT("layer input tensor not found");
         }
 
         const size_t nbytes = ggml_nbytes(t);
         const size_t nfloats = nbytes / sizeof(float);
         GGML_ASSERT(n_tokens > 0);
-        GGML_ASSERT(nfloats % n_tokens == 0);
-
-        const size_t row_floats = nfloats / n_tokens;
-        const size_t dst_offset = token_offset * row_floats;
-        GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
-        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+
+        if (!dec_subset || dec_rows.size() == n_tokens) {
+            GGML_ASSERT(nfloats % n_tokens == 0);
+
+            const size_t row_floats = nfloats / n_tokens;
+            const size_t dst_offset = token_offset * row_floats;
+            GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
+
+            ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+            continue;
+        }
+
+        // subset: gather the decoder rows synchronously, then scatter each to its batch row
+        const size_t n_dec = dec_rows.size();
+        GGML_ASSERT(n_dec > 0 && nfloats % n_dec == 0);
+        const size_t row_floats = nfloats / n_dec;
+
+        std::vector<float> tmp(nfloats);
+        ggml_backend_tensor_get(t, tmp.data(), 0, nbytes);
+        for (size_t j = 0; j < n_dec; ++j) {
+            const size_t dst_offset = (token_offset + (size_t) dec_rows[j]) * row_floats;
+            GGML_ASSERT(dst_offset + row_floats <= embd_layer_inp[il].size);
+            memcpy(embd_layer_inp[il].data + dst_offset, tmp.data() + j*row_floats, row_floats*sizeof(float));
+        }
     }
 }
 
@@ -4053,6 +4088,32 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_context::set_ced_replay(llama_seq_id seq_id, llama_pos replay_from) {
+    if (seq_id < 0 || (size_t) seq_id >= cparams.ced_replay_from.size()) {
+        return;
+    }
+    cparams.ced_replay_from[seq_id] = replay_from;
+}
+
+llama_pos llama_context::ced_replay_from(llama_seq_id seq_id) const {
+    if (cparams.ced_replay_window == 0 || seq_id < 0 || (size_t) seq_id >= cparams.ced_replay_from.size()) {
+        return -1;
+    }
+    return cparams.ced_replay_from[seq_id];
+}
+
+uint32_t llama_ced_replay_window(const llama_context * ctx) {
+    return ctx->ced_replay_window();
+}
+
+void llama_set_ced_replay(llama_context * ctx, llama_seq_id seq_id, llama_pos replay_from) {
+    ctx->set_ced_replay(seq_id, replay_from);
+}
+
+llama_pos llama_ced_replay_from(const llama_context * ctx, llama_seq_id seq_id) {
+    return ctx->ced_replay_from(seq_id);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

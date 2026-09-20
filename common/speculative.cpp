@@ -1128,6 +1128,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
+            // CED bounded replay: rows before the sequence's replay start stopped at the target's
+            // encoder and carry no features; the draft's window ring only needs the replayed tail
+            {
+                const llama_pos ced_from = llama_ced_replay_from(ctx_tgt, seq_id);
+                if (ced_from >= 0) {
+                    while (i_batch_beg[seq_id] <= i_batch_end[seq_id] && batch_in.pos[i_batch_beg[seq_id]] < ced_from) {
+                        ++i_batch_beg[seq_id];
+                    }
+                    if (i_batch_beg[seq_id] > i_batch_end[seq_id]) {
+                        continue;
+                    }
+                }
+            }
+
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
