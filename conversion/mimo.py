@@ -5,12 +5,13 @@ import re
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import MmprojModel, ModelBase, TextModel, gguf
+from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf, logger
 
 
 @ModelBase.register("MiMoV2FlashForCausalLM", "MiMoV2ForCausalLM")
@@ -167,6 +168,118 @@ class MimoV2Model(TextModel):
 
         self.gguf_writer.add_nextn_predict_layers(self._n_nextn)
 
+    #
+    # MXFP4 routed experts (MiMo-V2.6) -> ggml MXFP4
+    #
+    # V2.6 keeps quant_method "fp8" (attention, the dense MLP and the MTP MLPs are
+    # still FP8 with 128x128 weight_scale_inv) and only flips store_dtype: the routed
+    # experts ship as OCP MXFP4, uint8 [rows, cols/2] E2M1 pairs plus a uint8
+    # [rows, cols/32] E8M0 weight_scale. Those are repacked losslessly here, so
+    # base.py's FP8 dequant keeps handling everything else.
+    _MXFP4_EXPERT_RE = re.compile(
+        r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+    )
+    _MXFP4_PROJ = {
+        "gate_proj": gguf.MODEL_TENSOR.FFN_GATE_EXP,
+        "up_proj": gguf.MODEL_TENSOR.FFN_UP_EXP,
+        "down_proj": gguf.MODEL_TENSOR.FFN_DOWN_EXP,
+    }
+
+    def _is_mxfp4_packed(self) -> bool:
+        quant_config = self.hparams.get("quantization_config") or {}
+        return quant_config.get("store_dtype") == "mxfp4"
+
+    def _mxfp4_expert_tensor(self, loaders: list[tuple[Callable[[], Tensor], Callable[[], Tensor]]]):
+        """
+        One stacked [n_expert, rows, cols] MXFP4 tensor, built lazily.
+
+        gguf_writer holds every added tensor until the final write, so building these
+        eagerly would keep every repacked expert layer in memory at once. lazy means
+        only the tensor being written is resident.
+        """
+        # meta shapes, so this does not read any weights
+        rows, packed_cols = loaders[0][0]().shape
+        n_blocks = (packed_cols * 2) // 32
+        byte_shape = (len(loaders), rows, n_blocks * 17)
+
+        def load(fns: list[tuple[Callable[[], Tensor], Callable[[], Tensor]]]) -> np.ndarray:
+            out = np.empty(byte_shape, dtype=np.uint8)
+            for eid, (packed_fn, scale_fn) in enumerate(fns):
+                out[eid] = self.repack_mxfp4_blocks(
+                    LazyTorchTensor.to_eager(packed_fn()),
+                    LazyTorchTensor.to_eager(scale_fn()),
+                )
+            return out
+
+        # loaders goes through args, not the closure, so that `func` matches
+        # LazyBase's single-argument shape
+        return gguf.LazyNumpyTensor(
+            meta=gguf.LazyNumpyTensor.meta_with_dtype_and_shape(np.uint8, byte_shape),
+            args=(loaders,),
+            func=load,
+        )
+
+    def _write_mxfp4_experts(self) -> None:
+        n_experts = self.hparams["n_routed_experts"]
+
+        quant_config = self.hparams.get("quantization_config") or {}
+        if (block_size := quant_config.get("mxfp4_block_size", 32)) != 32:
+            raise NotImplementedError(f"MXFP4 block size {block_size}, ggml block_mxfp4 is 32")
+
+        # (bid, proj) -> {expert id: (weight name, scale name)}
+        groups: dict[tuple[int, str], dict[int, tuple[str, str]]] = {}
+        for name in self.model_tensors:
+            m = self._MXFP4_EXPERT_RE.match(name)
+            if m is None:
+                continue
+            bid, eid, proj = int(m.group(1)), int(m.group(2)), m.group(3)
+            scale_name = name + "_scale"
+            if scale_name not in self.model_tensors:
+                raise KeyError(f"missing {scale_name} for {name}")
+            groups.setdefault((bid, proj), {})[eid] = (name, scale_name)
+
+        consumed: list[str] = []
+        for (bid, proj), experts in sorted(groups.items()):
+            missing = [e for e in range(n_experts) if e not in experts]
+            if missing or len(experts) != n_experts:
+                raise KeyError(
+                    f"layer {bid} {proj}: {len(experts)} of {n_experts} experts"
+                    + (f", first missing is {missing[0]}" if missing else "")
+                )
+
+            loaders = []
+            for eid in range(n_experts):
+                weight_name, scale_name = experts[eid]
+                loaders.append((self.model_tensors[weight_name], self.model_tensors[scale_name]))
+                consumed += [weight_name, scale_name]
+
+            data = self._mxfp4_expert_tensor(loaders)
+            new_name = self.format_tensor_name(self._MXFP4_PROJ[proj], bid)
+            shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
+            logger.info(
+                f"{new_name}: repacked {n_experts} experts to MXFP4, "
+                f"shape = {{{', '.join(str(n) for n in reversed(shape))}}}"
+            )
+            self.gguf_writer.add_tensor(new_name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+
+        for name in consumed:
+            del self.model_tensors[name]
+
+        # only the routed experts have a repack path; everything else is FP8
+        # (weight_scale_inv) and goes through base.py's dequant
+        stray = [n for n in self.model_tensors if n.endswith(".weight_scale")]
+        if stray:
+            raise NotImplementedError(
+                f"{len(stray)} MXFP4 scale tensor(s) outside the routed experts, e.g. {stray[0]!r}"
+            )
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        # not a generator on purpose: base.py chains this with get_tensors(), so the
+        # tensors used here must be removed from model_tensors before that starts
+        if self._is_mxfp4_packed():
+            self._write_mxfp4_experts()
+        return ()
+
     _experts: list[dict[str, Tensor]] | None = None
 
     @classmethod
@@ -228,6 +341,11 @@ class MimoV2Model(TextModel):
             experts = [k for d in self._experts for k in d.keys()]
             if len(experts) > 0:
                 raise ValueError(f"Unprocessed experts: {experts}")
+
+        if self._is_mxfp4_packed():
+            # label the file for what it is; prepare_metadata runs after this
+            self._is_mxfp4 = True
+            self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
 
 
 @ModelBase.register("MiMoV2ForCausalLM")
