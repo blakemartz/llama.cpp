@@ -100,9 +100,22 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
 
     const float v_scale = hparams.f_attn_value_scale;
     const bool emit_h_nextn = cparams.embeddings_nextn;
-    const bool crop_last_layer = inp_out_ids && (!emit_h_nextn || cparams.embeddings_nextn_masked);
+
+    // A DFlash/EAGLE3 draft asks for the *inputs* of a set of decoder layers (entry i is the
+    // input of layer i, entry n_layer is the final pre-norm state). Capture index n_layer needs
+    // every row, so the last layer's output crop is deferred until after the capture.
+    const bool want_layer_inp_last =
+        (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
+
+    const bool crop_last_layer = inp_out_ids && (!emit_h_nextn || cparams.embeddings_nextn_masked) && !want_layer_inp_last;
 
     for (int il = 0; il < n_layer; ++il) {
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = inpL;
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
         ggml_tensor * inpSA = inpL;
 
         uint32_t n_head_l    = hparams.n_head(il);
@@ -229,6 +242,19 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
     }
 
     cur = inpL;
+
+    if (want_layer_inp_last) {
+        // pre-final-norm hidden state, every row (mirrors SGLang's
+        // "num_hidden_layers in layers_to_capture -> capture the pre-norm output" case)
+        res->t_layer_inp[n_layer] = cur;
+        cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
+        ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
+
+        // apply the crop that the last layer skipped so the head still sees only the output rows
+        if (inp_out_ids && (!emit_h_nextn || cparams.embeddings_nextn_masked)) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+    }
 
     if (emit_h_nextn) {
         cb(cur, "h_nextn", -1);
