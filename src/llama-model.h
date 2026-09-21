@@ -688,6 +688,11 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
 
+    // trained embedding row for the MASK token (MiMo-V2.6 DFlash ships dflash/mask_embedding.pt).
+    // The draft borrows the target's token embeddings, whose MASK row is an untrained reserved
+    // slot, so the MASK positions of the noise block read this row instead.
+    struct ggml_tensor * dflash_mask_embd = nullptr;
+
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 

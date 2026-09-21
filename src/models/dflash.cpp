@@ -14,6 +14,19 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     // drafts for M-RoPE targets carry degenerate sections [n_rot/2, 0, 0, 0]
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
 
+    // MiMo-family drafters scale V before attention (Xiaomi's dflash_config.attention_value_scale).
+    // mimo2.cpp reads the same key; without this the 0.612 factor would be silently dropped.
+    float value_scale = 0.0f;
+    if (ml.get_key(LLM_KV_ATTENTION_VALUE_SCALE, value_scale, false)) {
+        if (!(value_scale > 0.0f)) {
+            throw std::runtime_error(format("DFlash: invalid %s = %f", "attention.value_scale", (double) value_scale));
+        }
+        if (value_scale != 1.0f) {
+            hparams.f_attn_value_scale = value_scale;
+            LLAMA_LOG_INFO("%s: DFlash attn value scale = %.6f\n", __func__, (double) value_scale);
+        }
+    }
+
     ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,       hparams.dflash_block_size,       false);
     ml.get_key(LLM_KV_DFLASH_CONV_KERNEL_SIZE, hparams.dflash_conv_kernel_size, false);
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
@@ -64,6 +77,11 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
             if (hparams.dsv4_compress_ratios[il] != 0) {
                 throw std::runtime_error("DSpark DSV4 draft expects uncompressed attention on all stages");
             }
+        }
+
+        // the DSV4 DSpark graph below applies neither of these; refuse rather than drop them
+        if (hparams.f_attn_value_scale != 0.0f) {
+            throw std::runtime_error("DSpark DSV4 draft carries attention.value_scale, which the DSV4 stage graph does not apply");
         }
 
         GGML_ASSERT(hparams.n_swa > 0);
@@ -148,6 +166,14 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
                 hparams.dflash_selector_rank, hparams.dflash_selector_top_k);
     }
 
+    // optional trained embedding row for the MASK token (MiMo-V2.6: dflash/mask_embedding.pt).
+    // Only this one row is stored - the draft still borrows the target's full embedding table.
+    dflash_mask_embd = create_tensor(tn(LLM_TENSOR_DFLASH_MASK_EMBD, "weight"), { n_embd }, TENSOR_NOT_REQUIRED);
+    if (dflash_mask_embd) {
+        LLAMA_LOG_INFO("%s: DFlash using a trained MASK embedding row (mask token id = %d)\n",
+                __func__, (int) vocab.token_mask());
+    }
+
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
@@ -158,6 +184,10 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab_draft }, TENSOR_NOT_REQUIRED);
 
     if (hparams.dsv4_hc_mult > 0) {
+        if (dflash_mask_embd) {
+            throw std::runtime_error("DSpark DSV4 draft carries mask_embd, which the DSV4 stage graph does not use");
+        }
+
         const int64_t q_lora_rank     = hparams.n_lora_q;
         const int64_t n_ff_exp        = hparams.n_ff_exp();
         const int64_t n_expert_shared = hparams.n_expert_shared;
@@ -677,6 +707,39 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     res->add_input(std::move(inp));
 
+    // The noise block is [id_last, MASK x (block_size-1)] looked up in the *target's* embedding
+    // table, whose MASK row is an untrained reserved slot (MiMo's tokenizer declares ids up to
+    // 151674, the mask token is 151675). Xiaomi ships the trained row separately and SGLang
+    // writes it into the target table at load time; here it travels in the draft GGUF and is
+    // swapped in per position:
+    //   keep = clamp(|tok - mask_id|, 0, 1)  -> exactly 0 at MASK, exactly 1 elsewhere
+    //   inpL = inpL*keep + mask_embd*(1 - keep)
+    if (model.dflash_mask_embd) {
+        const llama_token mask_id = model.vocab.token_mask();
+        GGML_ASSERT(mask_id != LLAMA_TOKEN_NULL &&
+                "DFlash draft carries mask_embd but its vocab has no MASK token id");
+        GGML_ASSERT(model.dflash_mask_embd->ne[0] == n_embd);
+
+        ggml_tensor * keep = ggml_cast(ctx0, inp_tokens, GGML_TYPE_F32);
+        keep = ggml_scale_bias(ctx0, keep, 1.0f, -(float) mask_id);
+        keep = ggml_clamp(ctx0, ggml_abs(ctx0, keep), 0.0f, 1.0f);
+        keep = ggml_reshape_2d(ctx0, keep, 1, n_tokens);
+
+        ggml_tensor * is_mask = ggml_scale_bias(ctx0, keep, -1.0f, 1.0f); // [1, n_tokens]
+
+        ggml_tensor * mask_embd = model.dflash_mask_embd;
+        if (mask_embd->type != GGML_TYPE_F32) {
+            mask_embd = ggml_cast(ctx0, mask_embd, GGML_TYPE_F32);
+        }
+        ggml_tensor * mask_row = ggml_repeat_4d(ctx0,
+                ggml_reshape_2d(ctx0, mask_embd, n_embd, 1), n_embd, n_tokens, 1, 1);
+
+        inpL = ggml_add(ctx0,
+                ggml_mul(ctx0, inpL,     keep),
+                ggml_mul(ctx0, mask_row, is_mask));
+        cb(inpL, "inp_noise_embd_masked", -1);
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
@@ -711,6 +774,15 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * cur = use_iswa
             ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
             : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+
+        // MiMo scales V before attention; o_proj is bias-free and linear, so scaling the
+        // projected output is identical and - unlike scaling V in the encoder - covers both
+        // the injected target-feature rows in the cache and the noise block's own V.
+        // Same placement as mimo2.cpp.
+        if (hparams.f_attn_value_scale) {
+            cur = ggml_scale(ctx0, cur, hparams.f_attn_value_scale);
+            cb(cur, "attn_out_scaled", il);
+        }
 
         if (attn_dynamic) {
             cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
