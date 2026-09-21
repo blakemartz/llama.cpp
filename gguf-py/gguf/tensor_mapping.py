@@ -1381,6 +1381,10 @@ class TensorNameMap:
             "encoder.fc", # dflash (transformers MuseGlimmerAssistant)
         ),
 
+        MODEL_TENSOR.DFLASH_MASK_EMBD: (
+            "model.mask_embd", # dflash (mimo-v2.6 ships it as dflash/mask_embedding.pt)
+        ),
+
         MODEL_TENSOR.DSPARK_MARKOV_W1: (
             "model.markov_head.markov_w1", # dspark
         ),

@@ -713,8 +713,55 @@ class DFlashModel(Qwen3Model):
 
         target_layer_ids = dflash_config.get("target_layer_ids", [])
         if target_layer_ids:
+            # Index convention: the checkpoint names the decoder layers it was trained on, and the
+            # feature it consumes is hidden_states[i + 1], i.e. the *output* of target layer i.
+            # llama.cpp's `target_layers` is an index into the runtime's per-layer hidden states
+            # where entry j is the *input* of layer j (llama_context sizes that vector
+            # n_layer + 1, and entry n_layer is the final pre-norm state). input(i+1) ==
+            # output(i), so the stored value is i + 1. SGLang does exactly the same
+            # (`layers_to_capture = [val + 1 for val in layer_ids]`, plus an explicit
+            # "num_hidden_layers in layers_to_capture -> capture the pre-norm output" case).
             extract_layer_ids = [i + 1 for i in target_layer_ids]
+            n_target_layers = self.hparams.get("num_target_layers")
+            if n_target_layers is None and self.target_model_dir is not None:
+                with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
+                    tcfg = json.load(f)
+                n_target_layers = tcfg.get("text_config", tcfg).get("num_hidden_layers")
+            if n_target_layers is not None and max(extract_layer_ids) > int(n_target_layers):
+                raise ValueError(
+                    f"DFlash target_layer_ids {target_layer_ids} -> extract {extract_layer_ids} "
+                    f"exceeds the target's {n_target_layers} layers (max valid index is "
+                    f"{n_target_layers}, the final pre-norm state)"
+                )
+            logger.info(f"DFlash: target_layer_ids {target_layer_ids} -> target_layers {extract_layer_ids} "
+                        f"(entry j = input of target layer j = output of layer j-1)")
             self.gguf_writer.add_target_layers(extract_layer_ids)
+
+        # MiMo-family drafters scale V before attention. mimo2/dflash read
+        # <arch>.attention.value_scale; without this it would be silently dropped.
+        value_scale = dflash_config.get(
+            "attention_value_scale", self.hparams.get("attention_value_scale")
+        )
+        if value_scale is not None:
+            self.gguf_writer.add_attn_value_scale(float(value_scale))
+            logger.info(f"DFlash: attention value scale = {float(value_scale)}")
+
+        # partial rotary: rope covers the first int(head_dim * factor) dims of each head.
+        # The base class writes key/value_length from head_dim but never n_rot, and llama.cpp
+        # defaults n_rot to head_dim -- which would rope all 128 dims instead of 64.
+        head_dim = self.hparams.get("head_dim") or (
+            self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
+        )
+        partial_rotary_factor = self.rope_parameters.get("partial_rotary_factor", 1.0)
+        n_rot = int(head_dim * partial_rotary_factor)
+        if n_rot != head_dim:
+            if n_rot <= 0 or n_rot % 2 != 0:
+                raise ValueError(
+                    f"DFlash: partial_rotary_factor {partial_rotary_factor} x head_dim {head_dim} "
+                    f"gives an unusable n_rot {n_rot}"
+                )
+            self.gguf_writer.add_rope_dimension_count(n_rot)
+            logger.info(f"DFlash: partial rotary {partial_rotary_factor} -> n_rot = {n_rot} of {head_dim}")
 
         use_sliding_window = self.hparams.get("use_sliding_window", False) or dflash_config.get("use_swa", False)
         sliding_window = dflash_config.get("swa_window_size") or self.hparams.get("sliding_window")
@@ -723,18 +770,81 @@ class DFlashModel(Qwen3Model):
             is_swa = [lt == "sliding_attention" for lt in layer_types]
             self.gguf_writer.add_sliding_window(sliding_window)
             self.gguf_writer.add_sliding_window_pattern(is_swa)
+            logger.info(f"DFlash: sliding window = {sliding_window} on {sum(is_swa)}/{len(is_swa)} layers")
+        elif sliding_window:
+            logger.warning(
+                f"DFlash: sliding_window={sliding_window} present but not written "
+                f"(use_sliding_window={use_sliding_window}, layer_types={layer_types!r}) -- "
+                "the draft will attend over its whole KV cache"
+            )
 
         causal = self.hparams.get("is_causal")
         if causal is None:
             causal = dflash_config.get("causal")
-        if causal is not None:
+        if causal is not None and self.hparams.get("is_causal") is not False:
+            # the base class already writes it when hparams["is_causal"] is False
+            # False -> the runtime calls llama_set_causal_attn(ctx_dft, false); with an SWA
+            # window still applied, that is the symmetric/bidirectional window the reference
+            # (and SGLang's AttentionType.ENCODER_ONLY branch) uses at decode.
             self.gguf_writer.add_causal_attention(bool(causal))
+        if causal is not None:
+            logger.info(f"DFlash: causal attention = {bool(causal)}")
+
+        # keys in dflash_config that the llama.cpp runtime has no use for
+        for k in ("num_anchors", "loss_decay_gamma"):
+            if k in dflash_config:
+                logger.info(f"DFlash: ignoring training-only dflash_config key {k}={dflash_config[k]!r}")
 
         # M-RoPE target: the draft ropes on the temporal dim only, so write
         # degenerate sections [n_rot/2, 0, 0, 0]
         if self._target_uses_mrope():
             head_dim = self.hparams.get("head_dim") or self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
             self.gguf_writer.add_rope_dimension_sections([head_dim // 2, 0, 0, 0])
+
+    # Xiaomi ships the drafter's trained MASK-token embedding row outside the safetensors, in
+    # dflash/mask_embedding.pt = {"mask_token_id": int, "embedding": [n_embd]}. The draft has no
+    # embed_tokens of its own and borrows the target's table, whose row 151675 is an untrained
+    # reserved slot (the tokenizer declares ids up to 151674). SGLang patches that row into the
+    # target's table at load time; here the single row travels in the draft GGUF as `mask_embd`
+    # and the graph substitutes it at the MASK positions -- the 152576 x 4096 table is not
+    # duplicated.
+    _MASK_EMBEDDING_FILE = "mask_embedding.pt"
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+
+        path = self.dir_model / self._MASK_EMBEDDING_FILE
+        if not path.is_file():
+            return
+
+        blob = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(blob, dict) or "embedding" not in blob:
+            raise ValueError(f"{path}: expected a dict with an 'embedding' entry, got {type(blob)}")
+        if blob.get("per_position"):
+            raise NotImplementedError(f"{path}: per-position mask embeddings are not supported")
+
+        embedding = blob["embedding"]
+        if embedding.ndim == 2 and embedding.shape[0] == 1:
+            embedding = embedding[0]
+        if embedding.ndim != 1:
+            raise ValueError(f"{path}: expected a 1-D embedding row, got shape {tuple(embedding.shape)}")
+
+        n_embd = self.hparams["hidden_size"]
+        if embedding.shape[0] != n_embd:
+            raise ValueError(f"{path}: embedding width {embedding.shape[0]} != hidden_size {n_embd}")
+
+        file_mask_id = blob.get("mask_token_id")
+        cfg_mask_id = self.hparams.get("dflash_config", {}).get("mask_token_id")
+        if file_mask_id is not None and cfg_mask_id is not None and int(file_mask_id) != int(cfg_mask_id):
+            raise ValueError(
+                f"{path}: mask_token_id {file_mask_id} does not match dflash_config.mask_token_id {cfg_mask_id}"
+            )
+        if file_mask_id is None and cfg_mask_id is None:
+            raise ValueError(f"{path}: no mask_token_id here or in dflash_config")
+
+        logger.info(f"DFlash: trained MASK embedding row for token {int(file_mask_id or cfg_mask_id)} "
+                    f"-> mask_embd.weight [{n_embd}]")
+        yield "model.mask_embd.weight", embedding
 
     def _target_uses_mrope(self) -> bool:
         if self.target_model_dir is None:
@@ -761,9 +871,34 @@ class DFlashModel(Qwen3Model):
         "self_attn.k_norm.weight",
     )
 
+    _n_attn_sinks = 0
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+        # dflash_config.attention_sink_bias advertises per-head sink logits; the reference
+        # dflash.py omits them but the checkpoint (and SGLang) use them, so a silent
+        # mismatch here would cost acceptance with no error.
+        dflash_config = self.hparams.get("dflash_config", {})
+        if dflash_config.get("attention_sink_bias") and self._n_attn_sinks == 0:
+            raise ValueError(
+                "DFlash: dflash_config.attention_sink_bias is true but the checkpoint carries no "
+                "self_attn.attention_sink_bias tensors"
+            )
+        if self._n_attn_sinks:
+            n_layer = self.hparams["num_hidden_layers"]
+            if self._n_attn_sinks != n_layer:
+                logger.warning(f"DFlash: {self._n_attn_sinks} attention_sink_bias tensors for "
+                               f"{n_layer} layers - the graph applies sinks per layer that has one")
+            else:
+                logger.info(f"DFlash: attention sinks on all {n_layer} layers")
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name == "model.embed_tokens.weight" and not self.hparams.get("has_embed_tokens", True):
             return
+
+        if "attention_sink_bias" in name or name.endswith((".self_attn.sinks", ".self_attn.sinks.weight")):
+            self._n_attn_sinks += 1
 
         # interleaved-rope checkpoints (rope_is_neox_style = false) -> NeoX layout: per head, even dims first then odd
         if not self.hparams.get("rope_is_neox_style", True) and name.endswith(self._ROPE_PERMUTE_SUFFIXES):

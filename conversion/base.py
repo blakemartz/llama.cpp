@@ -232,6 +232,11 @@ class ModelBase:
         prefix = "model" if not self.is_mistral_format else "consolidated"
         part_names: list[str] = ModelBase.get_model_part_names(self.dir_model, prefix, ".safetensors")
         is_safetensors: bool = len(part_names) > 0
+        if not is_safetensors and not self.is_mistral_format:
+            # A checkpoint may name its shards anything as long as the standard index lists them
+            # (XiaomiMiMo/MiMo-V2.6-*-RL's dflash/ ships model.safetensors.index.json pointing at
+            # dflash_draft_model.safetensors). part_names is filled from the index below.
+            is_safetensors = (self.dir_model / "model.safetensors.index.json").is_file()
         if not is_safetensors:
             part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
 
@@ -1213,8 +1218,7 @@ class ModelBase:
                 if config is not None:
                     return config
             logger.warning("Trying to load config.json instead")
-            with open(dir_model / "config.json", "r", encoding="utf-8") as f:
-                config = json.load(f)
+            config = gguf.load_json_relaxed(dir_model / "config.json")
         if "llm_config" in config:
             # rename for InternVL
             config["text_config"] = config["llm_config"]

@@ -9,6 +9,7 @@ from typing import Any, Literal, Optional
 from dataclasses import dataclass
 
 from .constants import Keys
+from .utility import load_json_relaxed
 
 import gguf
 
@@ -211,8 +212,7 @@ class Metadata:
         if not config_path.is_file():
             return {}
 
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return load_json_relaxed(config_path)
 
     @staticmethod
     def load_generation_config(model_path: Optional[Path] = None) -> dict[str, Any]:

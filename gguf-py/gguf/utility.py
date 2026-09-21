@@ -2,11 +2,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import os
 import json
+import logging
+import re
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+def load_json_relaxed(path: Path) -> Any:
+    """json.load(), with a fallback that strips trailing commas.
+
+    Strict parsing is always attempted first, so nothing is masked. Only a comma directly
+    before a closing brace or bracket is removed, and a warning is logged when it happens.
+    Some shipped checkpoints are not strict JSON - XiaomiMiMo/MiMo-V2.6-*-RL's
+    dflash/config.json ends with `"use_cache": true,` followed by `}`.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        repaired = re.sub(r",(\s*[}\]])", r"\1", text)
+        if repaired == text:
+            raise
+        obj = json.loads(repaired)
+        logger.warning(f"{path} is not strict JSON ({e}); stripped trailing comma(s) to parse it")
+        return obj
 
 
 def fill_templated_filename(filename: str, output_type: str | None) -> str:
