@@ -484,10 +484,9 @@ class MiMoV2VisionAudioModel(MmprojModel):
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         # note: audio encoder is in its own subdir "audio_tokenizer"
-        from safetensors.torch import load_file
+        from safetensors import safe_open
 
         tok_dir = self.dir_model / "audio_tokenizer"
-        state_dict = load_file(tok_dir / "model.safetensors")
 
         codebook_re = re.compile(r"^encoder\.quantizer\.vq\.layers\.(\d+)\._codebook\.embed$")
         codebooks: dict[int, Tensor] = {}
@@ -499,13 +498,31 @@ class MiMoV2VisionAudioModel(MmprojModel):
             "_codebook.embed_avg",
             "_codebook.inited",
         )
-        for name, tensor in state_dict.items():
-            if name.endswith(skip_suffixes):
-                continue
-            if m := codebook_re.match(name):
-                codebooks[int(m.group(1))] = tensor
-                continue
-            yield name, tensor
+        n_synthesis = 0
+        # read the file lazily: the synthesis half below is ~1 GB we never touch
+        with safe_open(str(tok_dir / "model.safetensors"), framework="pt") as f:
+            for name in f.keys():
+                # MiMo-V2.6 ships both halves of the audio codec in this file.
+                # "decoder.*" is the RVQ *decoder*: dconv stack, transformer layers,
+                # ISTFT vocoder and mel-spectrogram loss buffers, i.e. speech
+                # synthesis. Audio understanding only runs the encoder
+                # (AudioTokenizerEncoder.encode()), and mtmd's mimo_audio projector
+                # loads encoder-side tensors only, so drop them.
+                if name.startswith("decoder."):
+                    n_synthesis += 1
+                    continue
+                if name.endswith(skip_suffixes):
+                    continue
+                if m := codebook_re.match(name):
+                    codebooks[int(m.group(1))] = f.get_tensor(name)
+                    continue
+                yield name, f.get_tensor(name)
+
+        if n_synthesis > 0:
+            logger.info(
+                f"audio_tokenizer: skipping {n_synthesis} speech-synthesis tensors (decoder.*), "
+                "not used for audio understanding"
+            )
 
         # gather codebooks and merge into 3D tensor, similar to MoE MLP tensors
         n_q = len(codebooks)
