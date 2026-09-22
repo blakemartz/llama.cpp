@@ -370,6 +370,11 @@ struct common_params_speculative_ngram_cache {
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
+    // cap the draft context's physical batch size (0 = inherit the target's n_ubatch)
+    // the draft context reserves n_vocab x n_ubatch logits on its device, which the draft
+    // heads never read - they mark only the last row of each block as an output
+    int32_t n_ubatch = 0;
+
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 

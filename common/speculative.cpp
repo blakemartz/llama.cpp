@@ -2549,6 +2549,18 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // the draft context reserves n_vocab x n_ubatch logits on the draft device for rows it never
+    // reads, so allow its ubatch to be capped below the target's (n_batch is left alone - the
+    // drivers chunk their own decodes by llama_n_ubatch(ctx_dft))
+    if (params.speculative.n_ubatch > 0) {
+        // n_ubatch == 0 means "inherit n_batch", see llama_context
+        const uint32_t n_ubatch_tgt = cparams.n_ubatch > 0 ? cparams.n_ubatch : cparams.n_batch;
+
+        cparams.n_ubatch = std::min<uint32_t>(n_ubatch_tgt, (uint32_t) params.speculative.n_ubatch);
+
+        LOG_INF("%s: draft context n_ubatch = %u (target n_ubatch = %u)\n", __func__, cparams.n_ubatch, n_ubatch_tgt);
+    }
+
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
