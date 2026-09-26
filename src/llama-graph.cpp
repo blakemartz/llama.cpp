@@ -17,10 +17,15 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <map>
 #include <cmath>
 #include <cstring>
 #include <numeric>
 #include <sstream>
+
+// persistent routing-dump destinations, il -> (ids i32 [n_expert_used, n_ubatch], weights f32 [1, n_expert_used, n_ubatch]);
+// filled once by llama_context when LLAMA_MOE_ROUTE_DUMP is set (see build_moe_ffn)
+std::map<int, std::pair<ggml_tensor *, ggml_tensor *>> g_llama_moe_route_dst;
 #include <string>
 #include <unordered_set>
 
@@ -2154,19 +2159,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // LLAMA_MOE_ROUTE_DUMP=<path>: keep a copy of the routing (ids + final weights) as graph outputs so that
-    // llama_context can append it to <path> after compute. The copies are appended AFTER the (fusable) routing
-    // chain and only read its two out-nodes, so the chain still fuses and no arithmetic changes. Unset = no nodes.
+    // LLAMA_MOE_ROUTE_DUMP=<path>: copy the routing (ids + final weights) into persistent per-layer tensors that
+    // llama_context allocated on the layer's device (g_llama_moe_route_dst), so llama_context can append them to
+    // <path> after compute. The copies read only the routing chain's two out-nodes (the chain still fuses) and write
+    // into memory the graph allocator does not own, so the compute-buffer layout is unchanged (a ggml_cont output
+    // copy shifted gallocr's layout and changed greedy outputs). Unset = no nodes.
     static const bool moe_route_dump = [] { const char * p = getenv("LLAMA_MOE_ROUTE_DUMP"); return p && *p; }();
     if (moe_route_dump && il >= 0) {
-        ggml_tensor * rid = ggml_cont(ctx0, selected_experts); // [n_expert_used, n_tokens] i32
-        ggml_format_name(rid, "moe_route_ids-%d", il);
-        ggml_set_output(rid);
-        ggml_build_forward_expand(gf, rid);
-        ggml_tensor * rw = ggml_cont(ctx0, weights);           // [1, n_expert_used, n_tokens] f32
-        ggml_format_name(rw, "moe_route_w-%d", il);
-        ggml_set_output(rw);
-        ggml_build_forward_expand(gf, rw);
+        auto it = g_llama_moe_route_dst.find(il);
+        if (it != g_llama_moe_route_dst.end() && it->second.first->ne[1] >= n_tokens && it->second.first->ne[0] == n_expert_used) {
+            ggml_tensor * di = it->second.first;
+            ggml_tensor * dw = it->second.second;
+            ggml_tensor * ci = ggml_cpy(ctx0, selected_experts, ggml_view_2d(ctx0, di, n_expert_used, n_tokens, di->nb[1], 0));
+            ggml_format_name(ci, "moe_route_ids-%d", il);
+            ggml_build_forward_expand(gf, ci);
+            ggml_tensor * cw = ggml_cpy(ctx0, weights, ggml_view_3d(ctx0, dw, 1, n_expert_used, n_tokens, dw->nb[1], dw->nb[2], 0));
+            ggml_format_name(cw, "moe_route_w-%d", il);
+            ggml_build_forward_expand(gf, cw);
+        }
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);

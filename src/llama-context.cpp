@@ -23,6 +23,9 @@
 #include <string>
 #include <unordered_map>
 
+static FILE * llama_moe_route_dump_file();
+static void   llama_moe_route_dump_alloc(const llama_model & model, uint32_t n_ubatch);
+
 //
 // llama_context
 //
@@ -459,6 +462,10 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+        if (llama_moe_route_dump_file()) {
+            llama_moe_route_dump_alloc(model, cparams.n_ubatch);
         }
 
         sched_reserve();
@@ -1391,10 +1398,56 @@ bool llama_context::set_adapter_cvec(
 }
 
 // LLAMA_MOE_ROUTE_DUMP=<path>: append the MoE routing of every ubatch this process computes (see build_moe_ffn).
-// Record: header {u32 magic 'MRD1', u32 version 1, u64 ubatch counter, i32 n_tokens, i32 n_outputs,
+// Record: header {u32 magic 'MRD1', u32 version 2, u64 ubatch counter, i32 n_tokens, i32 n_outputs,
 // i32 kind (0 = single-token decode, 1 = verify: 2..16 tokens all output, 2 = prefill), i32 n_layers,
-// i32 n_expert_used, i32 pos0, i32 seq0, i32 reserved} then per layer {i32 il, i32 ids[n_tokens][n_expert_used],
-// f32 weights[n_tokens][n_expert_used]}. Contexts whose graph has no routing (e.g. a dense draft model) write nothing.
+// i32 n_expert_used, i32 pos0, i32 seq0, i32 reserved} then per layer {i32 il, i32 ncols, i32 ids[ncols][n_expert_used],
+// f32 weights[ncols][n_expert_used]} (version 2; ncols = n_tokens except the last layer of a prefill ubatch, where
+// only the output rows reach the FFN). Contexts whose graph has no routing (e.g. a dense draft model) write nothing.
+extern std::map<int, std::pair<ggml_tensor *, ggml_tensor *>> g_llama_moe_route_dst; // llama-graph.cpp
+
+// allocate the persistent per-layer destinations on the device that holds each MoE layer's router (once per process)
+static void llama_moe_route_dump_alloc(const llama_model & model, uint32_t n_ubatch) {
+    static std::vector<ggml_context *>          ctxs; // intentionally kept for the process lifetime
+    static std::vector<ggml_backend_buffer_t>   bufs;
+    if (!g_llama_moe_route_dst.empty()) {
+        return;
+    }
+    const auto & hp = model.hparams;
+    std::map<ggml_backend_buffer_type_t, std::vector<int>> by_buft;
+    for (int il = 0; il < (int) hp.n_layer() && il < (int) model.layers.size(); ++il) {
+        const ggml_tensor * gi = model.layers[il].ffn_gate_inp;
+        if (gi && gi->buffer && hp.n_expert_used(il) > 0) {
+            by_buft[ggml_backend_buffer_get_type(gi->buffer)].push_back(il);
+        }
+    }
+    size_t total = 0;
+    for (auto & kv : by_buft) {
+        ggml_init_params ip = { ggml_tensor_overhead() * 2 * kv.second.size() + 1024, nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        std::vector<std::pair<int, std::pair<ggml_tensor *, ggml_tensor *>>> made;
+        for (int il : kv.second) {
+            ggml_tensor * ti = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, hp.n_expert_used(il), n_ubatch);
+            ggml_tensor * tw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, hp.n_expert_used(il), n_ubatch);
+            ggml_format_name(ti, "moe_route_dst_ids-%d", il);
+            ggml_format_name(tw, "moe_route_dst_w-%d", il);
+            made.push_back({ il, { ti, tw } });
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, kv.first);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: cannot allocate routing-dump buffers on %s\n", __func__, ggml_backend_buft_name(kv.first));
+            ggml_free(ctx);
+            continue;
+        }
+        total += ggml_backend_buffer_get_size(buf);
+        ctxs.push_back(ctx);
+        bufs.push_back(buf);
+        for (auto & m : made) {
+            g_llama_moe_route_dst[m.first] = m.second;
+        }
+    }
+    LLAMA_LOG_WARN("%s: routing-dump destinations for %zu MoE layers, %.2f MiB\n", __func__, g_llama_moe_route_dst.size(), total / 1048576.0);
+}
+
 static FILE * llama_moe_route_dump_file() {
     static FILE * f = [] () -> FILE * {
         const char * p = getenv("LLAMA_MOE_ROUTE_DUMP");
@@ -1416,13 +1469,15 @@ static void llama_moe_route_dump(FILE * f, ggml_backend_sched_t sched, ggml_cgra
     static std::mutex mtx;
     static uint64_t   counter = 0;
 
-    std::map<int, std::pair<ggml_tensor *, ggml_tensor *>> layers;
+    // layers whose routing THIS graph copied (a dense draft graph has none; the destinations are process-wide)
+    std::map<int, std::pair<std::pair<ggml_tensor *, ggml_tensor *>, int32_t>> layers;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor * t = ggml_graph_node(gf, i);
         if (strncmp(t->name, "moe_route_ids-", 14) == 0) {
-            layers[atoi(t->name + 14)].first = t;
-        } else if (strncmp(t->name, "moe_route_w-", 12) == 0) {
-            layers[atoi(t->name + 12)].second = t;
+            auto it = g_llama_moe_route_dst.find(atoi(t->name + 14));
+            if (it != g_llama_moe_route_dst.end()) {
+                layers[it->first] = { it->second, (int32_t) t->ne[1] }; // columns written (last layer: outputs only)
+            }
         }
     }
     if (layers.empty()) {
@@ -1434,39 +1489,31 @@ static void llama_moe_route_dump(FILE * f, ggml_backend_sched_t sched, ggml_cgra
     std::lock_guard<std::mutex> lock(mtx);
 
     const int32_t n_tokens = (int32_t) ubatch.n_tokens;
-    int32_t n_used = 0;
-    for (auto & kv : layers) {
-        if (kv.second.first) {
-            n_used = (int32_t) kv.second.first->ne[0];
-            break;
-        }
-    }
+    const int32_t n_used = (int32_t) layers.begin()->second.first.first->ne[0];
     const int32_t kind = n_tokens == 1 ? 0 : (n_tokens <= 16 && n_outputs == n_tokens ? 1 : 2);
 
     struct {
         uint32_t magic, version;
         uint64_t counter;
         int32_t  n_tokens, n_outputs, kind, n_layers, n_expert_used, pos0, seq0, reserved;
-    } hdr = { 0x3144524d, 1, counter++, n_tokens, n_outputs, kind, (int32_t) layers.size(), n_used,
+    } hdr = { 0x3144524d, 2, counter++, n_tokens, n_outputs, kind, (int32_t) layers.size(), n_used,
               ubatch.pos ? (int32_t) ubatch.pos[0] : -1, (ubatch.seq_id && ubatch.seq_id[0]) ? (int32_t) ubatch.seq_id[0][0] : -1, 0 };
     fwrite(&hdr, sizeof(hdr), 1, f);
 
     std::vector<uint8_t> buf;
     for (auto & kv : layers) {
-        ggml_tensor * ti = kv.second.first;
-        ggml_tensor * tw = kv.second.second;
-        const int32_t il = kv.first;
+        ggml_tensor * ti = kv.second.first.first;
+        ggml_tensor * tw = kv.second.first.second;
+        const int32_t il    = kv.first;
+        const int32_t ncols = kv.second.second;
         fwrite(&il, sizeof(il), 1, f);
-        const size_t n = (size_t) n_used * n_tokens;
+        fwrite(&ncols, sizeof(ncols), 1, f);
+        const size_t n = (size_t) n_used * ncols;
         buf.assign(n * 4, 0);
-        if (ti && ggml_nbytes(ti) == n * 4) {
-            ggml_backend_tensor_get(ti, buf.data(), 0, n * 4);
-        }
+        ggml_backend_tensor_get(ti, buf.data(), 0, n * 4);   // first n_tokens columns of the persistent destination
         fwrite(buf.data(), 1, n * 4, f);
         buf.assign(n * 4, 0);
-        if (tw && ggml_nbytes(tw) == n * 4) {
-            ggml_backend_tensor_get(tw, buf.data(), 0, n * 4);
-        }
+        ggml_backend_tensor_get(tw, buf.data(), 0, n * 4);
         fwrite(buf.data(), 1, n * 4, f);
     }
     fflush(f);
