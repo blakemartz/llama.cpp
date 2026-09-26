@@ -2154,6 +2154,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // LLAMA_MOE_ROUTE_DUMP=<path>: keep a copy of the routing (ids + final weights) as graph outputs so that
+    // llama_context can append it to <path> after compute. The copies are appended AFTER the (fusable) routing
+    // chain and only read its two out-nodes, so the chain still fuses and no arithmetic changes. Unset = no nodes.
+    static const bool moe_route_dump = [] { const char * p = getenv("LLAMA_MOE_ROUTE_DUMP"); return p && *p; }();
+    if (moe_route_dump && il >= 0) {
+        ggml_tensor * rid = ggml_cont(ctx0, selected_experts); // [n_expert_used, n_tokens] i32
+        ggml_format_name(rid, "moe_route_ids-%d", il);
+        ggml_set_output(rid);
+        ggml_build_forward_expand(gf, rid);
+        ggml_tensor * rw = ggml_cont(ctx0, weights);           // [1, n_expert_used, n_tokens] f32
+        ggml_format_name(rw, "moe_route_w-%d", il);
+        ggml_set_output(rw);
+        ggml_build_forward_expand(gf, rw);
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {

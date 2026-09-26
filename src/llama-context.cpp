@@ -14,6 +14,8 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <map>
+#include <mutex>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -1388,6 +1390,88 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// LLAMA_MOE_ROUTE_DUMP=<path>: append the MoE routing of every ubatch this process computes (see build_moe_ffn).
+// Record: header {u32 magic 'MRD1', u32 version 1, u64 ubatch counter, i32 n_tokens, i32 n_outputs,
+// i32 kind (0 = single-token decode, 1 = verify: 2..16 tokens all output, 2 = prefill), i32 n_layers,
+// i32 n_expert_used, i32 pos0, i32 seq0, i32 reserved} then per layer {i32 il, i32 ids[n_tokens][n_expert_used],
+// f32 weights[n_tokens][n_expert_used]}. Contexts whose graph has no routing (e.g. a dense draft model) write nothing.
+static FILE * llama_moe_route_dump_file() {
+    static FILE * f = [] () -> FILE * {
+        const char * p = getenv("LLAMA_MOE_ROUTE_DUMP");
+        if (!p || !*p) {
+            return nullptr;
+        }
+        FILE * fp = fopen(p, "ab");
+        if (!fp) {
+            LLAMA_LOG_ERROR("%s: cannot open LLAMA_MOE_ROUTE_DUMP=%s\n", __func__, p);
+        } else {
+            LLAMA_LOG_WARN("%s: MoE routing dump enabled -> %s\n", __func__, p);
+        }
+        return fp;
+    }();
+    return f;
+}
+
+static void llama_moe_route_dump(FILE * f, ggml_backend_sched_t sched, ggml_cgraph * gf, const llama_ubatch & ubatch, int32_t n_outputs) {
+    static std::mutex mtx;
+    static uint64_t   counter = 0;
+
+    std::map<int, std::pair<ggml_tensor *, ggml_tensor *>> layers;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (strncmp(t->name, "moe_route_ids-", 14) == 0) {
+            layers[atoi(t->name + 14)].first = t;
+        } else if (strncmp(t->name, "moe_route_w-", 12) == 0) {
+            layers[atoi(t->name + 12)].second = t;
+        }
+    }
+    if (layers.empty()) {
+        return;
+    }
+
+    ggml_backend_sched_synchronize(sched);
+
+    std::lock_guard<std::mutex> lock(mtx);
+
+    const int32_t n_tokens = (int32_t) ubatch.n_tokens;
+    int32_t n_used = 0;
+    for (auto & kv : layers) {
+        if (kv.second.first) {
+            n_used = (int32_t) kv.second.first->ne[0];
+            break;
+        }
+    }
+    const int32_t kind = n_tokens == 1 ? 0 : (n_tokens <= 16 && n_outputs == n_tokens ? 1 : 2);
+
+    struct {
+        uint32_t magic, version;
+        uint64_t counter;
+        int32_t  n_tokens, n_outputs, kind, n_layers, n_expert_used, pos0, seq0, reserved;
+    } hdr = { 0x3144524d, 1, counter++, n_tokens, n_outputs, kind, (int32_t) layers.size(), n_used,
+              ubatch.pos ? (int32_t) ubatch.pos[0] : -1, (ubatch.seq_id && ubatch.seq_id[0]) ? (int32_t) ubatch.seq_id[0][0] : -1, 0 };
+    fwrite(&hdr, sizeof(hdr), 1, f);
+
+    std::vector<uint8_t> buf;
+    for (auto & kv : layers) {
+        ggml_tensor * ti = kv.second.first;
+        ggml_tensor * tw = kv.second.second;
+        const int32_t il = kv.first;
+        fwrite(&il, sizeof(il), 1, f);
+        const size_t n = (size_t) n_used * n_tokens;
+        buf.assign(n * 4, 0);
+        if (ti && ggml_nbytes(ti) == n * 4) {
+            ggml_backend_tensor_get(ti, buf.data(), 0, n * 4);
+        }
+        fwrite(buf.data(), 1, n * 4, f);
+        buf.assign(n * 4, 0);
+        if (tw && ggml_nbytes(tw) == n * 4) {
+            ggml_backend_tensor_get(tw, buf.data(), 0, n * 4);
+        }
+        fwrite(buf.data(), 1, n * 4, f);
+    }
+    fflush(f);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1456,6 +1540,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (FILE * rf = llama_moe_route_dump_file(); rf && gtype != LLM_GRAPH_TYPE_ENCODER) {
+        llama_moe_route_dump(rf, sched.get(), res->get_gf(), ubatch, (int32_t) n_outputs);
     }
 
     ret = GGML_STATUS_SUCCESS;
