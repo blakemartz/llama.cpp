@@ -2019,16 +2019,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             int backend_id = split->backend_id;
             for (int j = 0; j < split->n_inputs; j++) {
                 struct ggml_tensor * input = split->inputs[j];
-                size_t id = hash_id(input);
                 // Registering a copy as a leaf is the other half of pinning it: leafs are allocated up front and
                 // live for the whole graph, where a node's memory is reused once its last consumer has passed.
                 // A staging copy of a host weight is ONE tensor shared by every slot (see split_graph) precisely
                 // so that it can be reused, and it is already added as a node above - so skip it here, or the
-                // exemption buys nothing. (Not detected by the slots aliasing any more: user-input copies alias
-                // their slots too since the single upload per device, and those MUST stay pinned leafs.)
+                // exemption buys nothing. (Not detected by the slots aliasing: user-input copies alias their
+                // slots too since the single upload per device, and those MUST stay pinned leafs.)
                 if (ggml_backend_sched_is_host_weight(input)) {
-                    continue;
+                    continue; // not kept for the whole graph, the allocator reuses its memory after the split
                 }
+                size_t id = hash_id(input);
                 for (int c = 0; c < sched->n_copies; c++) {
                     struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
                     if (c > 0 && input_cpy == tensor_id_copy(id, backend_id, c - 1)) {
@@ -2153,6 +2153,12 @@ static bool ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
         return true;
+    }
+
+    if (sched->n_copies > 1 && ggml_backend_sched_is_host_weight(input)) {
+        // the single copy is reused by the allocator, so write it in order with the work of the split backend
+        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+        return false;
     }
 
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
@@ -2495,13 +2501,13 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(sizes);
 
-    ggml_backend_sched_reset(sched);
-
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+
+    ggml_backend_sched_reset(sched);
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
