@@ -957,6 +957,7 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    ggml_backend_event_t input_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES]; // user inputs uploaded from the host copy
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1119,6 +1120,11 @@ static void ggml_backend_sched_invalidate_copies(
             i++;
         }
     }
+}
+
+// views of the inputs from the user (e.g. reshaped inputs) can be split inputs too
+static bool ggml_backend_sched_is_user_input(const struct ggml_tensor * t) {
+    return (t->flags & GGML_TENSOR_FLAG_INPUT) || (t->view_src != NULL && (t->view_src->flags & GGML_TENSOR_FLAG_INPUT));
 }
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
@@ -1776,6 +1782,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             // on the consuming device's own stream, so stream order alone keeps ubatch i's kernel
                             // ahead of ubatch i+1's copy.
                             const bool weight = ggml_backend_sched_is_host_weight(src);
+                            // user inputs are uploaded in order on the stream of the split backend before the
+                            // splits are submitted (compute_splits), so one copy is enough
+                            // too - but unlike a weight copy it stays pinned (INPUT/OUTPUT) for the whole graph
+                            const bool single_copy = weight || ggml_backend_sched_is_user_input(src);
                             struct ggml_tensor * shared = NULL;
                             for (int c = 0; c < sched->n_copies; c++) {
                                 struct ggml_tensor * tensor_copy = shared;
@@ -1787,7 +1797,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                         ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                                     }
                                     SET_CAUSE(tensor_copy, "%s", weight ? "4.cpyw" : "4.cpy");
-                                    if (weight) {
+                                    if (single_copy) {
                                         shared = tensor_copy;
                                     }
                                 }
@@ -2014,12 +2024,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 // live for the whole graph, where a node's memory is reused once its last consumer has passed.
                 // A staging copy of a host weight is ONE tensor shared by every slot (see split_graph) precisely
                 // so that it can be reused, and it is already added as a node above - so skip it here, or the
-                // exemption buys nothing. Detected by the slots aliasing, which is exactly the shared case.
-                if (tensor_id_copy(id, backend_id, 0) == tensor_id_copy(id, backend_id, 1)) {
+                // exemption buys nothing. (Not detected by the slots aliasing any more: user-input copies alias
+                // their slots too since the single upload per device, and those MUST stay pinned leafs.)
+                if (ggml_backend_sched_is_host_weight(input)) {
                     continue;
                 }
                 for (int c = 0; c < sched->n_copies; c++) {
                     struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
+                    if (c > 0 && input_cpy == tensor_id_copy(id, backend_id, c - 1)) {
+                        continue;
+                    }
+                    if (c > 0 && input_cpy == tensor_id_copy(id, backend_id, c - 1)) {
+                        continue;
+                    }
                     sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
                     assert(graph_copy->size > graph_copy->n_leafs);
                     graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
@@ -2106,6 +2123,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
 // returns true when the copy callback handled the copy (it may then have copied only part of the tensor)
 static bool ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+    if (sched->n_copies > 1 && ggml_backend_sched_is_user_input(input)) {
+        return false; // already uploaded by ggml_backend_sched_compute_splits
+    }
+
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
@@ -2162,6 +2183,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<ggml_backend_sched_copied_input> copied;
 
     sched->n_input_copies = 0;
+
+    // with pipeline parallelism, upload the user inputs before submitting the splits, to not wait for this graph in a later split
+    if (sched->n_copies > 1) {
+        // the user writes the inputs of the next graph to the next host copy, so wait until its previous uploads are done
+        const int next_copy = (sched->cur_copy + 1) % sched->n_copies;
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (sched->input_events[b][next_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->input_events[b][next_copy]);
+            }
+        }
+        bool uploaded[GGML_SCHED_MAX_BACKENDS] = { false };
+        for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+            struct ggml_backend_sched_split * split = &splits[split_id];
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                struct ggml_tensor * input = split->inputs[input_id];
+                if (!ggml_backend_sched_is_user_input(input)) {
+                    continue;
+                }
+                struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+                if (ggml_backend_buffer_is_host(input->buffer)) {
+                    ggml_backend_tensor_set_async(sched->backends[split->backend_id], input_cpy, input->data, 0, ggml_nbytes(input));
+                } else {
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
+                uploaded[split->backend_id] = true;
+            }
+        }
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (uploaded[b] && sched->input_events[b][sched->cur_copy] != NULL) {
+                ggml_backend_event_record(sched->input_events[b][sched->cur_copy], sched->backends[b]);
+            }
+        }
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -2381,6 +2435,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+                sched->input_events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
         }
     }
@@ -2400,6 +2455,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+            ggml_backend_event_free(sched->input_events[b][c]);
         }
     }
     ggml_gallocr_free(sched->galloc);
