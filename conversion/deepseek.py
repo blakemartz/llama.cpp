@@ -723,25 +723,32 @@ class DeepseekV4Model(TextModel):
             del self.model_tensors[name]
 
     def _write_mxfp4_expert_tensor(self, bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> list[str]:
+        import os as _os
         n_experts = self.hparams["n_routed_experts"]
-        data: np.ndarray | None = None
         consumed: list[str] = []
+        sources: list[tuple[Callable[[], Tensor], Callable[[], Tensor]]] = []
 
         for eid in range(n_experts):
             weight_name = f"layers.{bid}.ffn.experts.{eid}.{proj}.weight"
             scale_name = f"layers.{bid}.ffn.experts.{eid}.{proj}.scale"
             if weight_name not in self.model_tensors or scale_name not in self.model_tensors:
                 raise KeyError(f"Missing routed expert tensors for {weight_name}")
-
-            weight = LazyTorchTensor.to_eager(self.model_tensors[weight_name]())
-            scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
-            packed = self.repack_mxfp4_blocks(weight, scale)
-            if data is None:
-                data = np.empty((n_experts, *packed.shape), dtype=packed.dtype)
-            data[eid] = packed
+            # capture the loaders, not the names: consumed entries leave model_tensors before the write
+            sources.append((self.model_tensors[weight_name], self.model_tensors[scale_name]))
             consumed.extend((weight_name, scale_name))
 
-        assert data is not None
+        if _os.environ.get("V41_ENGRAM_STAGE_ONLY") == "1":
+            return consumed
+
+        def repack(w: Callable[[], Tensor], s: Callable[[], Tensor]) -> np.ndarray:
+            return self.repack_mxfp4_blocks(LazyTorchTensor.to_eager(w()), LazyTorchTensor.to_eager(s()))
+
+        # one expert resident at a time: an eager [n_experts, ...] block is ~2.4 GiB per tensor, and
+        # without --use-temp-file the writer keeps every added tensor until the end (~290 GiB here)
+        first = repack(*sources[0])
+        data = gguf.LazyChunkedTensor([lambda w=w, s=s: repack(w, s)[None] for w, s in sources],
+                                      (n_experts, *first.shape), first.dtype)
+        del first
         new_name = self.format_tensor_name(tensor_key, bid)
         shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
         logger.info(f"{new_name}: repacked routed experts to MXFP4, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
