@@ -1326,7 +1326,7 @@ class DeepseekV41Model(DeepseekV4Model):
             per_group = n_cols // scale_groups if has_scale else 0
 
             row_bytes = int(gguf.quantize(_np.zeros((1, n_cols), dtype=_np.float32), qtype).nbytes)
-            rows_per_chunk = min(int(self._V41_ENGRAM_CHUNK_ROWS), n_rows)
+            rows_per_chunk = min(int(_os.environ.get("V41_ENGRAM_CHUNK_ROWS") or self._V41_ENGRAM_CHUNK_ROWS), n_rows)
             n_chunks = (n_rows + rows_per_chunk - 1) // rows_per_chunk
 
             tmp_dir = _os.environ.get("V41_ENGRAM_TMPDIR") or _tempfile.gettempdir()
@@ -1337,8 +1337,16 @@ class DeepseekV41Model(DeepseekV4Model):
                 n_rows * row_bytes / 1e9, tmp_path,
             )
 
-            out = _np.memmap(tmp_path, dtype=_np.uint8, mode="w+", shape=(n_rows, row_bytes))
-            for ci, start in enumerate(range(0, n_rows, rows_per_chunk)):
+            # V41_ENGRAM_REUSE=1: take a staging file a previous V41_ENGRAM_STAGE_ONLY run left behind
+            # (exact size match only) instead of re-reading the FP8 table. The source shard then only
+            # has to supply its header, so it can be a sparse stub; this is how a checkpoint whose HF
+            # copy + engram staging + output exceed the disk gets converted.
+            reuse = (_os.environ.get("V41_ENGRAM_REUSE") == "1" and _os.path.isfile(tmp_path)
+                     and _os.path.getsize(tmp_path) == n_rows * row_bytes)
+            if reuse:
+                logger.info("engram layer %d: reusing staged %s", bid, tmp_path)
+            out = _np.memmap(tmp_path, dtype=_np.uint8, mode="r" if reuse else "w+", shape=(n_rows, row_bytes))
+            for ci, start in enumerate(range(0, 0 if reuse else n_rows, rows_per_chunk)):
                 stop = min(start + rows_per_chunk, n_rows)
                 chunk = wsl[start:stop, :].float()
                 if has_scale:
@@ -1350,7 +1358,13 @@ class DeepseekV41Model(DeepseekV4Model):
                 del chunk
                 if ci % 25 == 0:
                     logger.info("  engram layer %d: %d / %d rows", bid, stop, n_rows)
-            out.flush()
+            if not reuse:
+                out.flush()
+
+        if _os.environ.get("V41_ENGRAM_STAGE_ONLY") == "1":
+            logger.info("engram layer %d: staged %s (stage-only, kept)", bid, tmp_path)
+            del out
+            return [weight_name] + ([scale_name] if has_scale else [])
 
         new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, bid, ".weight")
         self.gguf_writer.add_tensor(new_name, out, raw_dtype=qtype)
@@ -1360,11 +1374,16 @@ class DeepseekV41Model(DeepseekV4Model):
         # (that leftover staging is what overflowed the disk on the first --use-temp-file run).
         del out
         import gc as _gc; _gc.collect()
-        try:
-            _os.remove(tmp_path)
-            logger.info("engram layer %d: removed staging %s", bid, tmp_path)
-        except OSError:
-            pass
+        # A reused (or V41_ENGRAM_KEEP=1) staging file is the only copy of the table once its shard is
+        # a stub, so it survives a failed run; delete it by hand after verifying the output.
+        if _os.environ.get("V41_ENGRAM_KEEP") == "1" or reuse:
+            logger.info("engram layer %d: keeping staging %s", bid, tmp_path)
+        else:
+            try:
+                _os.remove(tmp_path)
+                logger.info("engram layer %d: removed staging %s", bid, tmp_path)
+            except OSError:
+                pass
 
         consumed = [weight_name]
         if has_scale:
@@ -1378,6 +1397,10 @@ class DeepseekV41Model(DeepseekV4Model):
         for bid in (self.hparams.get("engram_layer_ids") or []):
             if f"layers.{bid}.engram.embed.weight" in self.model_tensors:
                 consumed.extend(self._write_engram_table(int(bid)))
+        import os as _os, sys as _sys
+        if _os.environ.get("V41_ENGRAM_STAGE_ONLY") == "1":
+            logger.info("V41_ENGRAM_STAGE_ONLY: engram tables staged, exiting before any output is written")
+            _sys.exit(0)
         for name in consumed:
             if name in self.model_tensors:
                 del self.model_tensors[name]
