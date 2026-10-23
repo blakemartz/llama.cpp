@@ -2958,12 +2958,34 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     // with pipeline parallelism, reading the ids would stall the graphs in flight, so upload all the experts of a large batch:
     // 16 ids per expert while a previous graph runs, else a full batch with 64 ids per expert (the graph may be alone)
     // the flag stays for the rest of the graph, e.g. for the last layer on the output rows
+    //
+    // fork: LLAMA_PP_UPLOAD_ALL_MIN_IDS overrides the in-flight threshold with an absolute id count N (the lone-graph
+    // threshold becomes 4*N, keeping the PR's 16:64 ratio and its full-batch condition); N <= 0 never uploads whole
+    // tensors, i.e. always takes the used-rows path below. Whole tensors move n_expert/n_used_distinct times the
+    // bytes of the used rows (DeepSeek-V4.1-Flash at ub 1536: 9216 ids >= 16*384, but only ~57-121 of the 384
+    // experts are touched per op); the used-rows path instead costs a host synchronization on the split backend
+    // (it reads the ids), which stops the host from queueing later graphs until this device reaches this op.
     if (lctx->cparams.pipeline_parallel) {
-        const int64_t n_ids      = ggml_nelements(ids);
-        const bool    full_batch = ids->ne[1] >= (int64_t) std::min(lctx->cparams.n_ctx, lctx->cparams.n_ubatch);
-        st.upload_all = st.upload_all || (st.prev_in_flight ? n_ids >= 16*n_expert : full_batch && n_ids >= 64*n_expert);
-        if (st.upload_all) {
-            return false;
+        static const int64_t min_ids_env = []() -> int64_t {
+            const char * env = getenv("LLAMA_PP_UPLOAD_ALL_MIN_IDS");
+            if (env == nullptr) {
+                return -1; // PR default
+            }
+            const int64_t v = std::max<int64_t>(0, atoll(env));
+            LLAMA_LOG_INFO("sched_copy_experts: LLAMA_PP_UPLOAD_ALL_MIN_IDS = %" PRId64 " (%s)\n", v,
+                    v == 0 ? "whole-tensor expert uploads disabled" : "whole-tensor expert uploads from this many ids");
+            return v;
+        }();
+        const int64_t min_ids_in_flight = min_ids_env < 0 ? 16*n_expert : min_ids_env;
+        const int64_t min_ids_alone     = min_ids_env < 0 ? 64*n_expert : 4*min_ids_env;
+
+        if (min_ids_env != 0) {
+            const int64_t n_ids      = ggml_nelements(ids);
+            const bool    full_batch = ids->ne[1] >= (int64_t) std::min(lctx->cparams.n_ctx, lctx->cparams.n_ubatch);
+            st.upload_all = st.upload_all || (st.prev_in_flight ? n_ids >= min_ids_in_flight : full_batch && n_ids >= min_ids_alone);
+            if (st.upload_all) {
+                return false;
+            }
         }
     }
 
