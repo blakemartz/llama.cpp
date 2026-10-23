@@ -2034,9 +2034,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (c > 0 && input_cpy == tensor_id_copy(id, backend_id, c - 1)) {
                         continue;
                     }
-                    if (c > 0 && input_cpy == tensor_id_copy(id, backend_id, c - 1)) {
-                        continue;
-                    }
                     sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
                     assert(graph_copy->size > graph_copy->n_leafs);
                     graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
