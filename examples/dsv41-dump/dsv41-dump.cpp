@@ -46,6 +46,20 @@
 
 #include <unistd.h>
 
+// common_batch_add was removed upstream when the examples moved to llama_batch_ext (#29601); this tool still
+// fills a plain llama_batch, so keep the old helper's semantics locally.
+static void dump_batch_add(llama_batch & b, llama_token id, llama_pos pos, const std::vector<llama_seq_id> & seq_ids, bool logits) {
+    b.token   [b.n_tokens] = id;
+    b.pos     [b.n_tokens] = pos;
+    b.n_seq_id[b.n_tokens] = (int32_t) seq_ids.size();
+    for (size_t i = 0; i < seq_ids.size(); ++i) {
+        b.seq_id[b.n_tokens][i] = seq_ids[i];
+    }
+    b.logits  [b.n_tokens] = logits;
+    b.n_tokens++;
+}
+
+
 struct dump_state {
     std::regex    filter;
     std::regex    marker;          // per-graph node that starts a ubatch (name regex; empty = structural)
@@ -308,7 +322,7 @@ int main(int argc, char ** argv) {
             st.disabled = true;
             llama_batch pre = llama_batch_init((int32_t) n_pre, 0, 1);
             for (size_t i = 0; i < n_pre; ++i) {
-                common_batch_add(pre, tokens[i], (llama_pos) i, { 0 }, false);
+                dump_batch_add(pre, tokens[i], (llama_pos) i, { 0 }, false);
             }
             const int rc_pre = llama_decode(ctx, pre);
             llama_batch_free(pre);
@@ -334,7 +348,7 @@ int main(int argc, char ** argv) {
 
     llama_batch batch = llama_batch_init((int32_t) (tokens.size() - tok_first), 0, 1);
     for (size_t i = tok_first; i < tokens.size(); ++i) {
-        common_batch_add(batch, tokens[i], (llama_pos) i, { 0 }, all_logits || i + 1 == tokens.size());
+        dump_batch_add(batch, tokens[i], (llama_pos) i, { 0 }, all_logits || i + 1 == tokens.size());
     }
     const int rc = llama_decode(ctx, batch);
     llama_batch_free(batch);
