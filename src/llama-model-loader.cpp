@@ -15,6 +15,13 @@
 #include <regex>
 #include <unordered_set>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1416,6 +1423,83 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+// LLAMA_MMAP_OVERLAY="[idx:]path@offset[,...]": map a local file over [offset, offset + size) of model file
+// idx's mapping (default 0). The local file must hold exactly those bytes of the model file, offset page
+// aligned; then every reader sees the same bytes, but page faults are served by the local file. Use case:
+// the GGUF lives on a network mount and only its lazy tables (the 194 GiB DSV4.1 engram, ~48 random 4 KiB
+// rows per token) need local latency. The first and last page are compared before mapping; any mismatch,
+// misalignment or out-of-range overlay is fatal rather than a silent fallback to the slow path.
+static void apply_mmap_overlays(const llama_mmaps & mappings) {
+#if defined(_WIN32)
+    GGML_UNUSED(mappings);
+#else
+    const char * env = getenv("LLAMA_MMAP_OVERLAY");
+    if (!env || !*env) {
+        return;
+    }
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    std::string spec(env);
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        size_t end = spec.find(',', pos);
+        if (end == std::string::npos) {
+            end = spec.size();
+        }
+        std::string item = spec.substr(pos, end - pos);
+        pos = end + 1;
+
+        uint32_t idx = 0;
+        const size_t colon = item.find(':');
+        if (colon != std::string::npos && colon < item.find('/')) {
+            idx  = (uint32_t) std::stoul(item.substr(0, colon));
+            item = item.substr(colon + 1);
+        }
+        const size_t at = item.rfind('@');
+        if (at == std::string::npos) {
+            throw std::runtime_error(format("LLAMA_MMAP_OVERLAY: '%s' is not path@offset", item.c_str()));
+        }
+        const std::string path = item.substr(0, at);
+        const size_t      offs = (size_t) std::stoull(item.substr(at + 1));
+        if (idx >= mappings.size()) {
+            throw std::runtime_error(format("LLAMA_MMAP_OVERLAY: no model file %u", idx));
+        }
+        const auto & mapping = mappings[idx];
+
+        const int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            throw std::runtime_error(format("LLAMA_MMAP_OVERLAY: cannot open %s: %s", path.c_str(), strerror(errno)));
+        }
+        struct stat st;
+        fstat(fd, &st);
+        const size_t size = (size_t) st.st_size;
+        if (offs % page != 0 || size == 0 || offs + size > mapping->size()) {
+            close(fd);
+            throw std::runtime_error(format("LLAMA_MMAP_OVERLAY: %s (%zu B @ %zu) is misaligned or outside the %zu B mapping",
+                    path.c_str(), size, offs, mapping->size()));
+        }
+
+        uint8_t * dst = (uint8_t *) mapping->addr() + offs;
+        std::vector<uint8_t> buf(page);
+        for (const size_t probe : { (size_t) 0, (size - 1) / page * page }) {
+            const size_t n = std::min(page, size - probe);
+            if (pread(fd, buf.data(), n, (off_t) probe) != (ssize_t) n || memcmp(buf.data(), dst + probe, n) != 0) {
+                close(fd);
+                throw std::runtime_error(format("LLAMA_MMAP_OVERLAY: %s differs from the model file at +%zu", path.c_str(), probe));
+            }
+        }
+
+        void * p = mmap(dst, size, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0);
+        close(fd);
+        if (p == MAP_FAILED || p != dst) {
+            throw std::runtime_error(format("LLAMA_MMAP_OVERLAY: mmap of %s failed: %s", path.c_str(), strerror(errno)));
+        }
+        posix_madvise(dst, size, POSIX_MADV_RANDOM);   // the lazy ranges' advice does not carry over to the new mapping
+        LLAMA_LOG_INFO("%s: file %u [%zu, %zu) served from %s (%.2f GiB)\n", __func__, idx, offs, offs + size,
+                path.c_str(), size / 1073741824.0);
+    }
+#endif
+}
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
@@ -1447,6 +1531,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             }
             mappings.emplace_back(std::move(mapping));
         }
+        apply_mmap_overlays(mappings);
     }
 
     // compute the total size of all tensors for progress reporting
