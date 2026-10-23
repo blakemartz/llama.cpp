@@ -1301,12 +1301,46 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return true;
     }
 
+    // tokens in one sequence's noise block: the per-sequence override (the server uses it for the remaining context
+    // size and for per-request `speculative.n_max`) can only shrink the block, never grow it past the buffers sized
+    // at init
+    int32_t block_tokens(const common_speculative_draft_params & dp) const {
+        const int32_t n_draft = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+        return is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
+        // DSpark's Markov/confidence head reads every block of a decode at one stride and asserts equal-size blocks,
+        // but slots can ask for different sizes (per-request `speculative.n_max`, the remaining-context clamp): with
+        // -np 4 and the gateway's cap-3/cap-5 hook, 3+5+5 aborted the server (2026-10-23). Decode one batch per
+        // distinct block size instead; a single size (the common case) is still a single decode.
+        std::vector<int32_t> sizes;
+        if (is_dspark) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    const int32_t n = block_tokens(dparams[seq_id]);
+                    if (std::find(sizes.begin(), sizes.end(), n) == sizes.end()) {
+                        sizes.push_back(n);
+                    }
+                }
+            }
+        }
+        if (sizes.size() <= 1) {
+            draft_blocks(dparams, -1);
+            return;
+        }
+        for (const int32_t n : sizes) {
+            draft_blocks(dparams, n);
+        }
+    }
+
+    // draft every sequence whose block has `only_size` tokens (-1: every drafting sequence) in one decode
+    void draft_blocks(common_speculative_draft_params_vec & dparams, int32_t only_size) {
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
 
-        // build one batch holding every drafting sequence's noise block into a single decode)
+        // build one batch holding every selected sequence's noise block into a single decode
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
@@ -1317,15 +1351,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
+            const int32_t n_block_tokens = block_tokens(dp);
+            if (only_size >= 0 && n_block_tokens != only_size) {
+                continue;
+            }
+
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
-
-            // honor the per-sequence override (the server uses it for the remaining context size and for
-            // per-request `speculative.n_max`); it can only shrink the block, never grow it past the
-            // buffers sized at init
-            const int32_t n_draft = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
-            const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1398,7 +1431,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
                 const float   p_min = dp.p_min >= 0.0f ? dp.p_min : params.p_min;
-                const float * conf  = p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                // cumulative floor: the product of the per-position confidences estimates the chance the whole
+                // prefix survives verification, which is what a draft token's cost should be weighed against
+                const float   p_cum_min = dp.p_cum_min >= 0.0f ? dp.p_cum_min : params.p_cum_min;
+                const float * conf  = p_min > 0.0f || p_cum_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                float         p_cum = 1.0f;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
@@ -1406,6 +1443,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     if (conf && conf[(size_t) idx * n_embd_dec] < p_min) {
                         break;
+                    }
+                    if (conf && p_cum_min > 0.0f) {
+                        p_cum *= conf[(size_t) idx * n_embd_dec];
+                        if (p_cum < p_cum_min) {
+                            break;
+                        }
                     }
 
                     common_sampler_sample(smpl, ctx_dft, idx, true);
@@ -2991,14 +3034,20 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.drafting && !result.empty()) {
                 dp.drafting = false;
 
-                if (dp.n_max > 0) {
-                    if (!result.empty() && (int) result.size() > dp.n_max) {
-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
-                        result.resize(dp.n_max);
+                // n-gram drafters are capped by their own config and the remaining context only (see n_max_ctx)
+                const auto t = impl->type;
+                const bool draftless = t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE || t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
+                                       t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V || t == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
+                                       t == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+                const int32_t cap = draftless && dp.n_max_ctx > 0 ? dp.n_max_ctx : dp.n_max;
+                if (cap > 0) {
+                    if (!result.empty() && (int) result.size() > cap) {
+                        SPC_DBG("truncating draft to %d tokens\n", cap);
+                        result.resize(cap);
 
                         // trim the candidates only if the drafter produced them (n-gram drafters do not)
                         if (dp.result_q && !dp.result_q->empty()) {
-                            dp.result_q->resize(dp.n_max);
+                            dp.result_q->resize(cap);
                         }
                     }
                 }
@@ -3131,7 +3180,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
         }
 
-        SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
+        SPC_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
                 impl->n_gen_drafts,

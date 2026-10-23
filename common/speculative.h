@@ -82,6 +82,14 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // fork: the remaining-context clamp alone (-1 disabled). `n_max` above folds it together with the per-request
+    // `speculative.n_max`; that request cap is a DSpark/model-drafter knob (the gateway sets 3/5 by content), so
+    // draftless n-gram drafters in a chain (`--spec-type ngram-mod,draft-dspark`) are clamped by this instead
+    int32_t n_max_ctx = -1;
+
+    // fork: per-sequence cumulative confidence floor for DSpark (< 0: use the speculator's configured value)
+    float p_cum_min = -1.0f;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

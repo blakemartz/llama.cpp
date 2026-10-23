@@ -788,7 +788,7 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
-            SLT_TRC(*this,
+            SLT_INF(*this,   // fork: INF, not TRC - per-position acceptance is what every drafter A/B needs
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
@@ -3798,6 +3798,8 @@ private:
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
                         };
+                        common_speculative_get_draft_params(spec.get(), slot.id).n_max_ctx = slot.get_n_draft_max();
+                        common_speculative_get_draft_params(spec.get(), slot.id).p_cum_min = slot.task->params.speculative.draft.p_cum_min;
 
                         drafting.push_back(&slot);
                     }

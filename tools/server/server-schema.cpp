@@ -210,6 +210,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0.0f, 1.0f)
         ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy)"));
 
+    add((new field_num("speculative.p_cum_min", params.speculative.draft.p_cum_min))
+        ->set_hard_limits(0.0f, 1.0f)
+        ->set_desc("DSpark: stop drafting once the cumulative confidence (product over positions) drops below this (0 = off)"));
+
 
 #if 0
     add((new field_str("speculative.type"))
