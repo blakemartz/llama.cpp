@@ -132,12 +132,36 @@ static bool llama_host_weights_spread(const llama_model & model) {
         total += ggml_nbytes(t);
     }
     // no device holds more than 2/3 of them
+    bool spread = true;
     for (const auto & [dev, bytes] : dev_bytes) {
+        // fork: report the shares, so that a refused (or LLAMA_PP_FORCE'd) gate can be read off the log
+        LLAMA_LOG_INFO("%s: host weights of the layers on %s: %8.2f MiB (%5.1f %%)\n", __func__,
+                dev ? ggml_backend_dev_name(dev) : "(none)", bytes/1024.0/1024.0, total ? 100.0*bytes/total : 0.0);
         if (3*bytes > 2*total) {
-            return false;
+            spread = false;
         }
     }
-    return true;
+    return spread;
+}
+
+// fork: LLAMA_PP_FORCE=1 overrides the 2/3 spread gate above, and only that gate (the other conditions for
+// pipeline parallelism, and the async/events capability check, still apply; LLAMA_PIPELINE_PARALLEL=1 overrides
+// all of them). The gate assumes every layer's host weights are uploaded on every ubatch; it does not hold for
+// DeepSeek-V4.1 CED bounded replay, where the decoder layers past the kv_source layer see only the replayed rows
+// (none at all on a prompt ubatch that ends at the encoder), so their host experts barely move at prefill.
+static bool llama_host_weights_spread_or_forced(const llama_model & model) {
+    const bool spread = llama_host_weights_spread(model);
+    const char * env = getenv("LLAMA_PP_FORCE");
+    if (env != nullptr && atoi(env) != 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_PP_FORCE set: host-weight spread gate %s, overridden\n", __func__,
+                spread ? "passed" : "FAILED");
+        return true;
+    }
+    if (!spread) {
+        LLAMA_LOG_INFO("%s: one device holds more than 2/3 of the host weights: no pipeline parallelism "
+                "(LLAMA_PP_FORCE=1 overrides)\n", __func__);
+    }
+    return spread;
 }
 
 struct llm_fused_op_probe {
@@ -559,7 +583,7 @@ llama_context::llama_context(
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            (!model.has_tensor_overrides() || (cparams.op_offload && llama_host_weights_spread(model)));
+            (!model.has_tensor_overrides() || (cparams.op_offload && llama_host_weights_spread_or_forced(model)));
 
         // LLAMA_PIPELINE_PARALLEL overrides the conditions above. The -ot exclusion is there because a tensor
         // override can put a weight in host memory, and op-offload then stages that weight on the device - which
