@@ -2608,11 +2608,72 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// fork: pinned staging buffers for asynchronous host->device copies (GGML_CUDA_ASYNC_FOREIGN_COPY, 2026-10-24).
+// A buffer is handed out only when the device copy out of it is done (its event), and never freed in the hot path
+// (cudaFreeHost synchronizes the device). The caller fills it, enqueues the copy and records `done` on the stream.
+struct ggml_cuda_foreign_stage {
+    void *      host = nullptr;
+    size_t      size = 0;
+    cudaEvent_t done = nullptr; // recorded after the copy out of host
+};
+
+static ggml_cuda_foreign_stage * ggml_cuda_stage_acquire(int device, size_t nbytes) {
+    static std::mutex mutex;
+    static std::vector<std::unique_ptr<ggml_cuda_foreign_stage>> pools[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_foreign_stage * st = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto & pool = pools[device];
+        // smallest free buffer that fits; none -> a new one (never grow one)
+        for (auto & cand : pool) {
+            if (cand->size < nbytes || (st != nullptr && cand->size >= st->size)) {
+                continue;
+            }
+            if (cudaEventQuery(cand->done) != cudaSuccess) {
+                continue; // still in flight (cudaErrorNotReady)
+            }
+            st = cand.get();
+        }
+        (void) cudaGetLastError(); // clear the cudaErrorNotReady of the queries
+        if (st == nullptr) {
+            pool.push_back(std::make_unique<ggml_cuda_foreign_stage>());
+            st = pool.back().get();
+            CUDA_CHECK(cudaEventCreateWithFlags(&st->done, cudaEventDisableTiming));
+        }
+    }
+    if (st->host == nullptr) {
+        CUDA_CHECK(cudaMallocHost(&st->host, nbytes));
+        st->size = nbytes;
+    }
+    return st;
+}
+
+static bool ggml_cuda_async_foreign_copy_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_ASYNC_FOREIGN_COPY") != nullptr;
+    return enabled;
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    // fork: from pageable memory cudaMemcpyAsync blocks the host until the stream reaches the copy - with the stream
+    // waiting on a remote stage that is the whole stage. Large pageable sources go through a pinned staging buffer.
+    if (ggml_cuda_async_foreign_copy_enabled() && size >= (1u << 20)) {
+        cudaPointerAttributes attr;
+        const bool pageable = cudaPointerGetAttributes(&attr, data) != cudaSuccess || attr.type == cudaMemoryTypeUnregistered;
+        (void) cudaGetLastError();
+        if (pageable) {
+            ggml_cuda_set_device(cuda_ctx->device);
+            ggml_cuda_foreign_stage * st = ggml_cuda_stage_acquire(cuda_ctx->device, size);
+            memcpy(st->host, data, size);
+            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, st->host, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+            CUDA_CHECK(cudaEventRecord(st->done, cuda_ctx->stream()));
+            return;
+        }
+    }
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2658,11 +2719,6 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 // Staging buffers come from a per-device pool and are reused only once the device copy out of them is done (never
 // waited for: keying them by destination address made the host wait whenever the allocator reused an address
 // within one graph, behind a stream that is itself waiting on the remote stage).
-struct ggml_cuda_foreign_stage {
-    void *      host = nullptr;
-    size_t      size = 0;
-    cudaEvent_t done = nullptr; // recorded after the copy out of host
-};
 
 static void CUDART_CB ggml_cuda_foreign_wait_cb(void * data) {
     ggml_backend_event_t ev = (ggml_backend_event_t) data;
@@ -2671,8 +2727,7 @@ static void CUDART_CB ggml_cuda_foreign_wait_cb(void * data) {
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async_foreign(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
-    static const bool enabled = getenv("GGML_CUDA_ASYNC_FOREIGN_COPY") != nullptr;
-    if (!enabled || !ggml_backend_is_cuda(backend_dst) || ggml_backend_is_cuda(backend_src)) {
+    if (!ggml_cuda_async_foreign_copy_enabled() || !ggml_backend_is_cuda(backend_dst) || ggml_backend_is_cuda(backend_src)) {
         return false;
     }
     // a non-contiguous view is copied as its byte span, exactly like ggml_backend_tensor_copy does: the copy tensor
@@ -2700,38 +2755,10 @@ static bool ggml_backend_cuda_cpy_tensor_async_foreign(ggml_backend_t backend_sr
         return false;
     }
 
-    static std::mutex mutex;
-    static std::vector<std::unique_ptr<ggml_cuda_foreign_stage>> pools[GGML_CUDA_MAX_DEVICES];
     const size_t nbytes = ggml_nbytes(src);
 
     ggml_cuda_set_device(cuda_ctx->device);
-    ggml_cuda_foreign_stage * st = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto & pool = pools[cuda_ctx->device];
-        // smallest free buffer that fits; none -> a new one (never grow one: cudaFreeHost synchronizes the device)
-        ggml_cuda_foreign_stage * best = nullptr;
-        for (auto & cand : pool) {
-            if (cand->size < nbytes || (best != nullptr && cand->size >= best->size)) {
-                continue;
-            }
-            if (cudaEventQuery(cand->done) != cudaSuccess) {
-                continue; // still in flight (cudaErrorNotReady)
-            }
-            best = cand.get();
-        }
-        (void) cudaGetLastError(); // clear the cudaErrorNotReady of the queries
-        if (best == nullptr) {
-            pool.push_back(std::make_unique<ggml_cuda_foreign_stage>());
-            best = pool.back().get();
-            CUDA_CHECK(cudaEventCreateWithFlags(&best->done, cudaEventDisableTiming));
-        }
-        st = best;
-    }
-    if (st->host == nullptr) {
-        CUDA_CHECK(cudaMallocHost(&st->host, nbytes));
-        st->size = nbytes;
-    }
+    ggml_cuda_foreign_stage * st = ggml_cuda_stage_acquire(cuda_ctx->device, nbytes);
 
     if (src_host) {
         ggml_backend_synchronize(backend_src);
