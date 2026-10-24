@@ -2914,7 +2914,7 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
         lctx->n_reallocs_same++;
     }
 
-    LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
+    LLAMA_LOG_WARN("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
 }
@@ -3010,6 +3010,26 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             if (st.upload_all) {
                 return false;
             }
+        }
+    }
+
+    // fork: LLAMA_EXPERT_GATHER_DEVICE=1 - the backend marks the used experts from the ids and gathers them from the pinned
+    // host weights itself (ggml-cuda: ggml_backend_cuda_gather_used_experts), so this path takes no host synchronization and
+    // the host keeps queueing later splits. Same bytes as the host path below, which remains the fallback.
+    {
+        using gather_fn_t = bool (*)(ggml_backend_t, const ggml_tensor *, const ggml_tensor *, ggml_tensor *);
+        static const gather_fn_t gather_fn = []() -> gather_fn_t {
+            const char * env = getenv("LLAMA_EXPERT_GATHER_DEVICE");
+            if (env == nullptr || atoi(env) == 0) {
+                return nullptr;
+            }
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+            auto fn = reg ? (gather_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gather_used_experts") : nullptr;
+            LLAMA_LOG_INFO("sched_copy_experts: LLAMA_EXPERT_GATHER_DEVICE = %s\n", fn ? "device-side used-expert gather" : "requested, unavailable");
+            return fn;
+        }();
+        if (gather_fn && !lctx->moe_cache && gather_fn(backend, ids, src, dst)) {
+            return true;
         }
     }
 

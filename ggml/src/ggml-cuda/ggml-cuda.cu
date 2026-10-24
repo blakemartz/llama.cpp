@@ -5282,6 +5282,95 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+// fork: device-side used-expert gather (2026-10-23), reached through get_proc_address("ggml_backend_cuda_gather_used_experts").
+// llama's sched_copy_experts uploads only the experts a host-weight MUL_MAT_ID uses, and to know which it reads the router
+// ids back to the host: one backend synchronize per host-streamed expert layer. That keeps the host in lock-step with this
+// device, so with pipeline parallelism it cannot queue later splits (e.g. the RPC stage of the next ubatch) until this device
+// has reached the layer. Here the ids never leave the GPU: one kernel marks the experts the ids touch, a second copies those
+// experts - plus the padding past a run's last expert that the MMQ path reads - from the pinned host weights into the device
+// tensor with zero-copy reads, all on this backend's stream. The bytes that land are the ones the host path copies, so the
+// arithmetic is unchanged. Returns false (caller falls back to the host path) unless every operand is where this expects.
+static __global__ void k_expert_mark_used(const char * ids, const int64_t ne0, const int64_t ne1, const size_t nb0, const size_t nb1,
+        const int n_expert, int * used) {
+    const int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x;
+    if (i >= ne0*ne1) {
+        return;
+    }
+    const int32_t id = *(const int32_t *) (ids + (i/ne0)*nb1 + (i%ne0)*nb0);
+    if (id >= 0 && id < n_expert) {
+        used[id] = 1;
+    }
+}
+
+static __global__ void k_expert_gather(const int * used, const char * src, char * dst, const size_t expert_size,
+        const size_t total_size, const int n_expert, const size_t pad) {
+    const int e = blockIdx.y;
+    if (!used[e]) {
+        return;
+    }
+    const size_t beg = (size_t) e*expert_size;
+    size_t       end = beg + expert_size + (e + 1 < n_expert && !used[e + 1] ? pad : 0);
+    end = end < total_size ? end : total_size;
+
+    // 16-byte words covering [beg, end): both bases are 16-byte aligned, so src and dst share alignment; spilling into a
+    // neighbouring expert copies that expert's own weights, which is what the host path leaves there too
+    const size_t w_beg = beg/16;
+    const size_t w_end = end/16;
+    const int4 * s4 = (const int4 *) src;
+    int4       * d4 = (int4 *) dst;
+    for (size_t w = w_beg + blockIdx.x*(size_t) blockDim.x + threadIdx.x; w < w_end; w += (size_t) gridDim.x*blockDim.x) {
+        d4[w] = s4[w];
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (size_t b = w_end*16 > beg ? w_end*16 : beg; b < end; ++b) {
+            dst[b] = src[b];
+        }
+    }
+}
+
+static bool ggml_backend_cuda_gather_used_experts(ggml_backend_t backend, const ggml_tensor * ids, const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_backend_is_cuda(backend) || ids->type != GGML_TYPE_I32 || ids->data == nullptr || src->data == nullptr || dst->data == nullptr) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    const ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(cuda_ctx->device);
+    const ggml_backend_buffer_t ids_buf = ids->view_src ? ids->view_src->buffer : ids->buffer;
+    const ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (ids_buf == nullptr || ids_buf->buft != buft || dst_buf == nullptr || dst_buf->buft != buft || ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+    if ((uintptr_t) src->data % 16 != 0 || (uintptr_t) dst->data % 16 != 0) {
+        return false;
+    }
+
+    // the source must be pinned host memory this device can read directly (CUDA_Host buffers are, under UVA)
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, src->data) != cudaSuccess || attr.type != cudaMemoryTypeHost || attr.devicePointer == nullptr) {
+        (void) cudaGetLastError();
+        return false;
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = cuda_ctx->stream();
+
+    const int64_t n_expert    = src->ne[2];
+    const size_t  expert_size = src->nb[2];
+    const size_t  pad         = expert_size < 512 ? expert_size : 512;
+
+    ggml_cuda_pool_alloc<int> used(cuda_ctx->pool(), n_expert);
+    CUDA_CHECK(cudaMemsetAsync(used.get(), 0, n_expert*sizeof(int), stream));
+
+    const int64_t n_ids = ggml_nelements(ids);
+    k_expert_mark_used<<<(n_ids + 255)/256, 256, 0, stream>>>((const char *) ids->data, ids->ne[0], ggml_nrows(ids), ids->nb[0], ids->nb[1],
+            (int) n_expert, used.get());
+
+    const dim3 grid(64, (unsigned) n_expert);
+    k_expert_gather<<<grid, 256, 0, stream>>>(used.get(), (const char *) attr.devicePointer, (char *) dst->data, expert_size, ggml_nbytes(src),
+            (int) n_expert, pad);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -6192,6 +6281,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_gather_used_experts") == 0) {
+        return (void *)ggml_backend_cuda_gather_used_experts;
     }
     return nullptr;
 }
