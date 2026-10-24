@@ -546,6 +546,14 @@ private:
     std::atomic_uint busy_spin_users = 0;
     std::atomic_bool running;
     std::thread      thread;
+
+    // fork: GGML_RPC_PIPELINE=1 - the dispatcher sends each request without waiting for its response; a receiver
+    // thread reads the responses (and completes the event markers) in order. The server answers strictly in
+    // order, so this only removes the client-side stall: the next requests travel while an earlier one waits.
+    bool             pipeline = false;
+    rpc_msg_queue    pending;
+    std::thread      rx_thread;
+    void             rx_work();
 };
 
 static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
@@ -663,7 +671,24 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     running = true;
+    pipeline = getenv("GGML_RPC_PIPELINE") != nullptr;
+    if (pipeline) {
+        rx_thread = std::thread([this] { rx_work(); });
+    }
     thread = std::thread(rpc_dispatcher_trampoline, this);
+}
+
+void rpc_dispatcher::rx_work() {
+    rpc_msg_ptr msg_ptr;
+    while (pending.pop(&msg_ptr)) {
+        if (msg_ptr->cmd != RPC_CMD_NONE) {
+            uint64_t out_size;
+            bool status = sock->recv_data(&out_size, sizeof(out_size)) && out_size == msg_ptr->output_size &&
+                          sock->recv_data(msg_ptr->output, msg_ptr->output_size);
+            RPC_STATUS_ASSERT(status);
+        }
+        msg_ptr->completion.set_value();
+    }
 }
 
 void rpc_dispatcher::work() {
@@ -686,7 +711,14 @@ void rpc_dispatcher::work() {
                      rpc_log_format_size(msg_ptr->input_size).c_str(), rpc_log_format_size(msg_ptr->output_size).c_str());
             const bool trace = rpc_log_debug_level() >= 3;
             const auto t0 = std::chrono::steady_clock::now();
-            if (msg_ptr->output) {
+            if (msg_ptr->output && pipeline) {
+                // the request goes now, the receiver thread reads the response and completes the message
+                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
+                RPC_STATUS_ASSERT(status);
+                GGML_ASSERT(pending.push(msg_ptr));
+                last_cmd = std::chrono::steady_clock::now();
+                continue;
+            } else if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
             } else {
@@ -699,6 +731,12 @@ void rpc_dispatcher::work() {
             }
         } else {
             LOG_DBG3("[%s] sync barrier\n", __func__);
+            if (pipeline) {
+                // a marker completes only once every earlier response has arrived: queue it behind them
+                GGML_ASSERT(pending.push(msg_ptr));
+                last_cmd = std::chrono::steady_clock::now();
+                continue;
+            }
         }
         msg_ptr->completion.set_value();
         last_cmd = std::chrono::steady_clock::now();
@@ -708,6 +746,10 @@ void rpc_dispatcher::work() {
 rpc_dispatcher::~rpc_dispatcher() {
     running = false;
     queue.interrupt();
+    pending.interrupt();
+    if (rx_thread.joinable()) {
+        rx_thread.join();
+    }
     sock = nullptr;
     if (thread.joinable()) {
         thread.join();
@@ -2559,6 +2601,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
+    // fork: GGML_RPC_READ_AHEAD_MB=<n> - keep reading the client's requests into memory while a command executes
+    // (e.g. a get_tensor waiting for the graph), so a pipelining client's next requests are already here (TCP only)
+    if (const char * ra = getenv("GGML_RPC_READ_AHEAD_MB")) {
+        sock->start_read_ahead((size_t) atoll(ra) << 20);
+        LOG_INFO("[%s] read-ahead up to %s MiB\n", __func__, ra);
+    }
     LOG_DBG("[%s] client connected, transport: %s\n", __func__, sock->transport_name());
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {

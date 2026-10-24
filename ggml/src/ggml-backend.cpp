@@ -2176,6 +2176,17 @@ static bool ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+        static const bool log_sync = getenv("GGML_SCHED_LOG_SYNC") != NULL;
+        if (log_sync) {
+            const int64_t t0 = ggml_time_us();
+            ggml_backend_synchronize(input_backend);
+            const double ms = (ggml_time_us() - t0) / 1000.0;
+            if (ms >= atof(getenv("GGML_SCHED_LOG_SYNC"))) {
+                GGML_LOG_WARN("sched sync src-backend: %.1f ms %s -> %s, %s (%s) %zu B%s\n", ms, ggml_backend_name(input_backend),
+                    ggml_backend_name(split_backend), input->name, ggml_op_desc(input), ggml_nbytes(input),
+                    ggml_is_contiguous(input) ? "" : " non-contiguous");
+            }
+        }
         ggml_backend_synchronize(input_backend);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_sched_event_sync_logged(sched->events[split_backend_id][sched->cur_copy], "sync-copy", input);

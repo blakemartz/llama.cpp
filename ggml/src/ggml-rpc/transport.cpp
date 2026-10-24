@@ -20,6 +20,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <deque>
+#include <vector>
+#include <algorithm>
 #include <optional>
 
 #ifdef GGML_RPC_RDMA
@@ -153,9 +158,93 @@ struct socket_t::impl {
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
     sockfd_t fd;
+
+    // fork: read-ahead (TCP only), see socket_t::start_read_ahead
+    void ra_start(size_t max_bytes);
+    void ra_loop();
+    bool ra_recv(void * data, size_t size);
+    std::thread                       ra_thread;
+    std::mutex                        ra_mutex;
+    std::condition_variable           ra_cv_data;
+    std::condition_variable           ra_cv_space;
+    std::deque<std::vector<uint8_t>>  ra_chunks;
+    size_t                            ra_off   = 0;
+    size_t                            ra_bytes = 0;
+    size_t                            ra_cap   = 0;
+    bool                              ra_eof   = false;
+    bool                              ra_stop  = false;
+    bool                              ra_active = false;
 };
 
+void socket_t::impl::ra_start(size_t max_bytes) {
+    if (use_rdma || ra_active || max_bytes == 0) {
+        return;
+    }
+    ra_cap    = max_bytes;
+    ra_active = true;
+    ra_thread = std::thread([this] { ra_loop(); });
+}
+
+void socket_t::impl::ra_loop() {
+    static constexpr size_t RA_CHUNK = 4u << 20;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(ra_mutex);
+            ra_cv_space.wait(lock, [this] { return ra_bytes < ra_cap || ra_stop; });
+            if (ra_stop) {
+                break;
+            }
+        }
+        std::vector<uint8_t> buf(RA_CHUNK);
+        ssize_t n = recv(fd, (char *) buf.data(), buf.size(), 0);
+        std::unique_lock<std::mutex> lock(ra_mutex);
+        if (n <= 0) {
+            ra_eof = true;
+            ra_cv_data.notify_all();
+            break;
+        }
+        buf.resize((size_t) n);
+        ra_bytes += (size_t) n;
+        ra_chunks.push_back(std::move(buf));
+        ra_cv_data.notify_all();
+    }
+}
+
+bool socket_t::impl::ra_recv(void * data, size_t size) {
+    size_t got = 0;
+    std::unique_lock<std::mutex> lock(ra_mutex);
+    while (got < size) {
+        ra_cv_data.wait(lock, [this] { return !ra_chunks.empty() || ra_eof; });
+        if (ra_chunks.empty()) {
+            return false;
+        }
+        auto & c = ra_chunks.front();
+        const size_t take = std::min(c.size() - ra_off, size - got);
+        memcpy((char *) data + got, c.data() + ra_off, take);
+        got      += take;
+        ra_off   += take;
+        ra_bytes -= take;
+        if (ra_off == c.size()) {
+            ra_chunks.pop_front();
+            ra_off = 0;
+        }
+        ra_cv_space.notify_one();
+    }
+    return true;
+}
+
 socket_t::impl::~impl() {
+    if (ra_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(ra_mutex);
+            ra_stop = true;
+        }
+        ra_cv_space.notify_all();
+#ifndef _WIN32
+        shutdown(this->fd, SHUT_RD); // wake a blocked recv
+#endif
+        ra_thread.join();
+    }
 #ifdef GGML_RPC_RDMA
     rdma.reset();
 #endif // GGML_RPC_RDMA
@@ -558,6 +647,9 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
 
 bool socket_t::impl::recv_data(void * data, size_t size) {
     LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
+    if (ra_active) {
+        return ra_recv(data, size);
+    }
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
         return rdma->recv(data, size);
@@ -681,6 +773,10 @@ void socket_t::get_caps(uint8_t * local_caps) {
 
 void socket_t::update_caps(const uint8_t * remote_caps) {
     return pimpl->update_caps(remote_caps);
+}
+
+void socket_t::start_read_ahead(size_t max_bytes) {
+    pimpl->ra_start(max_bytes);
 }
 
 const char * socket_t::transport_name() const {

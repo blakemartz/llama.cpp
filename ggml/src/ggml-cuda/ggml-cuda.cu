@@ -2675,7 +2675,9 @@ static bool ggml_backend_cuda_cpy_tensor_async_foreign(ggml_backend_t backend_sr
     if (!enabled || !ggml_backend_is_cuda(backend_dst) || ggml_backend_is_cuda(backend_src)) {
         return false;
     }
-    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+    // a non-contiguous view is copied as its byte span, exactly like ggml_backend_tensor_copy does: the copy tensor
+    // has the same layout (strides), so the span maps byte for byte
+    if (!ggml_are_same_layout(src, dst)) {
         return false;
     }
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
@@ -2700,7 +2702,7 @@ static bool ggml_backend_cuda_cpy_tensor_async_foreign(ggml_backend_t backend_sr
 
     static std::mutex mutex;
     static std::vector<std::unique_ptr<ggml_cuda_foreign_stage>> pools[GGML_CUDA_MAX_DEVICES];
-    const size_t nbytes = ggml_nbytes(dst);
+    const size_t nbytes = ggml_nbytes(src);
 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_foreign_stage * st = nullptr;

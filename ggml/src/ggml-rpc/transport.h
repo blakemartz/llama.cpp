@@ -25,6 +25,9 @@ struct socket_t {
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
     const char * transport_name() const;
+    // fork: a background thread keeps reading the (TCP) socket into memory, up to max_bytes ahead, and recv_data
+    // serves from it - so a peer can stream the next requests while this end is busy (GGML_RPC_READ_AHEAD_MB)
+    void start_read_ahead(size_t max_bytes);
 
     static socket_ptr create_server(const char * host, int port);
     static socket_ptr connect(const char * host, int port);
