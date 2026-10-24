@@ -1482,8 +1482,9 @@ public:
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_2d(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
-    bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
+    bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response, size_t prefix = 0);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
+    bool get_tensor_deferred(const rpc_msg_get_tensor_req & request, socket_t * sock);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
@@ -1502,6 +1503,10 @@ public:
 
 private:
     void sync_all_backends();
+    ggml_backend_t backend_for_buffer(ggml_backend_buffer_t buffer) const;
+    ggml_tensor * deserialize_get_request(ggml_context * ctx, const rpc_msg_get_tensor_req & request);
+    ggml_backend_buffer_t pinned_acquire(ggml_backend_buffer_type_t buft, size_t size);
+    void pinned_release(ggml_backend_buffer_t buf);
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
@@ -1528,6 +1533,14 @@ private:
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     std::vector<comm_state> comm_states;
+public:
+    // fork: GGML_RPC_SERVER_ASYNC=1 (with write-behind) - set_tensor / get_tensor run stream-ordered on the device's
+    // backend instead of synchronizing it, so the next ubatch's inputs and graph queue behind the running graph
+    bool async_io = false;
+private:
+    bool graph_pending = false;   // a graph was queued since the last sync_all_backends
+    std::mutex                         pinned_mutex;
+    std::vector<ggml_backend_buffer_t> pinned_free;   // host (pinned) buffers for deferred get_tensor replies
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1807,7 +1820,6 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
-    sync_all_backends();
     // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes) |
     uint8_t  cache_flag;
     uint64_t offset;
@@ -1860,6 +1872,16 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         ofs.write((const char *)data, size);
         LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
+    // only a graph's inputs (a graph is queued) - weight loading stays synchronous, it would pin a stage per size
+    if (async_io && graph_pending && size <= ((size_t) 1 << 30)) {
+        if (ggml_backend_t backend = backend_for_buffer(tensor->buffer)) {
+            // queued behind the running graph; a pageable source is staged by the backend before this returns
+            // (CUDA: GGML_CUDA_ASYNC_FOREIGN_COPY + GGML_CUDA_STAGE_MIN_KB)
+            ggml_backend_tensor_set_async(backend, tensor, data, offset, size);
+            return true;
+        }
+    }
+    sync_all_backends();
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
 }
@@ -2030,7 +2052,8 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
     return true;
 }
 
-bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
+// prefix: bytes reserved ahead of the data (the write-behind path puts the message's size header there)
+bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response, size_t prefix) {
     sync_all_backends();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -2039,11 +2062,20 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     };
     ggml_context_ptr ctx_ptr { ggml_init(params) };
     GGML_ASSERT(ctx_ptr != nullptr);
-    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_get_request(ctx_ptr.get(), request);
+    if (tensor == nullptr) {
+        return false;
+    }
+    response.resize(prefix + request.size, 0);
+    ggml_backend_tensor_get(tensor, response.data() + prefix, request.offset, request.size);
+    return true;
+}
+
+ggml_tensor * rpc_server::deserialize_get_request(ggml_context * ctx, const rpc_msg_get_tensor_req & request) {
     ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
     if (tensor == nullptr || tensor->buffer == nullptr) {
         LOG_ERROR("[%s] error deserializing tensor\n", __func__);
-        return false;
+        return nullptr;
     }
     LOG_DBG2("[%s] tensor: %s, buffer: %p, data: %p, offset: %" PRIu64 ", size: %s\n", __func__,
              rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, request.offset,
@@ -2059,13 +2091,11 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
             request.size > (p1 - request.tensor.data - request.offset)) {
                 LOG_ERROR("[%s] requested tensor region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
                                __func__, request.tensor.data, request.offset, request.size, p0, p1);
-                return false;
+                return nullptr;
         }
     }
 
-    response.resize(request.size, 0);
-    ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
-    return true;
+    return tensor;
 }
 
 bool rpc_server::get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response) {
@@ -2301,6 +2331,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    graph_pending = true;
     sg.graph = graph;
     LOG_DBG3("[%s] device: %u, graph build: %.3f ms\n", __func__, device, deserialize_ms.count());
     return true;
@@ -2320,6 +2351,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    graph_pending = true;
     return true;
 }
 
@@ -2348,6 +2380,7 @@ void rpc_server::sync_all_backends() {
     for (ggml_backend_t backend : backends) {
         ggml_backend_synchronize(backend);
     }
+    graph_pending = false;
 }
 
 // The comm link between two servers uses the same caps negotiation as the client HELLO,
@@ -2478,6 +2511,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         graph->n_nodes  = n1 != nullptr ? 2 : 1;
         ggml_status status = ggml_backend_graph_compute_async(backend, graph);
         GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    graph_pending = true;
     };
 
     // wait for the pending subgraph that produced this partial
@@ -2560,6 +2594,85 @@ rpc_server::~rpc_server() {
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
+    for (auto buffer : pinned_free) {
+        ggml_backend_buffer_free(buffer);
+    }
+}
+
+ggml_backend_t rpc_server::backend_for_buffer(ggml_backend_buffer_t buffer) const {
+    if (buffer == nullptr || ggml_backend_buffer_is_host(buffer)) {
+        return nullptr;
+    }
+    for (ggml_backend_t backend : backends) {
+        if (ggml_backend_get_default_buffer_type(backend) == ggml_backend_buffer_get_type(buffer)) {
+            return backend;
+        }
+    }
+    return nullptr;
+}
+
+ggml_backend_buffer_t rpc_server::pinned_acquire(ggml_backend_buffer_type_t buft, size_t size) {
+    {
+        std::lock_guard<std::mutex> lock(pinned_mutex);
+        // smallest free buffer of this type that fits
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < pinned_free.size(); i++) {
+            ggml_backend_buffer_t b = pinned_free[i];
+            if (ggml_backend_buffer_get_type(b) == buft && ggml_backend_buffer_get_size(b) >= size &&
+                (best == SIZE_MAX || ggml_backend_buffer_get_size(b) < ggml_backend_buffer_get_size(pinned_free[best]))) {
+                best = i;
+            }
+        }
+        if (best != SIZE_MAX) {
+            ggml_backend_buffer_t b = pinned_free[best];
+            pinned_free.erase(pinned_free.begin() + best);
+            return b;
+        }
+    }
+    return ggml_backend_buft_alloc_buffer(buft, std::max<size_t>(size, 4096));
+}
+
+void rpc_server::pinned_release(ggml_backend_buffer_t buf) {
+    std::lock_guard<std::mutex> lock(pinned_mutex);
+    pinned_free.push_back(buf);
+}
+
+// the reply is copied out on the device's stream (behind the graph that produces it) into a pinned buffer and sent
+// by the writer thread once that copy is done; the command thread goes straight on to the next request
+bool rpc_server::get_tensor_deferred(const rpc_msg_get_tensor_req & request, socket_t * sock) {
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * tensor = deserialize_get_request(ctx_ptr.get(), request);
+    if (tensor == nullptr) {
+        return false;
+    }
+    std::vector<uint8_t> head(sizeof(uint64_t));
+    const uint64_t size = request.size;
+    memcpy(head.data(), &size, sizeof(size));
+
+    ggml_backend_t             backend = backend_for_buffer(tensor->buffer);
+    ggml_backend_dev_t         dev     = backend ? ggml_backend_get_device(backend) : nullptr;
+    ggml_backend_buffer_type_t hbt     = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (backend == nullptr || hbt == nullptr) {
+        // host buffer (or no pinned type): read it now, still sent in order by the writer
+        sync_all_backends();
+        auto * data = new std::vector<uint8_t>(request.size);
+        ggml_backend_tensor_get(tensor, data->data(), request.offset, request.size);
+        return sock->send_deferred(std::move(head), data->data(), data->size(), nullptr, [data] { delete data; });
+    }
+    ggml_backend_buffer_t pin = pinned_acquire(hbt, request.size);
+    void * dst = ggml_backend_buffer_get_base(pin);
+    ggml_backend_tensor_get_async(backend, tensor, dst, request.offset, request.size);
+    ggml_backend_event_t ev = ggml_backend_event_new(dev);
+    ggml_backend_event_record(ev, backend);
+    return sock->send_deferred(std::move(head), dst, request.size,
+        [ev] { ggml_backend_event_synchronize(ev); },
+        [this, ev, pin] { ggml_backend_event_free(ev); pinned_release(pin); });
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
@@ -2607,6 +2720,17 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         sock->start_read_ahead((size_t) atoll(ra) << 20);
         LOG_INFO("[%s] read-ahead up to %s MiB\n", __func__, ra);
     }
+    // fork: GGML_RPC_WRITE_BEHIND=1 - big get_tensor replies stream out from a writer thread (TCP only)
+    if (const char * wb = getenv("GGML_RPC_WRITE_BEHIND"); wb && atoi(wb) != 0) {
+        sock->start_write_behind();
+        LOG_INFO("[%s] write-behind on\n", __func__);
+        if (const char * as = getenv("GGML_RPC_SERVER_ASYNC"); as && atoi(as) != 0) {
+            server.async_io = true;
+            LOG_INFO("[%s] stream-ordered set/get on\n", __func__);
+        }
+    }
+    // the writer's hooks reference the server (pinned buffers): stop it before the server goes away
+    struct wb_guard { socket_ptr s; ~wb_guard() { s->stop_write_behind(); } } wb_stop_first { sock };
     LOG_DBG("[%s] client connected, transport: %s\n", __func__, sock->transport_name());
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
@@ -2796,6 +2920,25 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 rpc_msg_get_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
+                }
+                if (server.async_io) {
+                    if (!server.get_tensor_deferred(request, sock.get())) {
+                        return;
+                    }
+                    break;
+                }
+                if (sock->write_behind_active() && request.size >= (1u << 20)) {
+                    // the reply streams out from the writer thread while the next commands (e.g. the next graph) run
+                    std::vector<uint8_t> msg = sock->wb_acquire();
+                    if (!server.get_tensor(request, msg, sizeof(uint64_t))) {
+                        return;
+                    }
+                    const uint64_t size = request.size;
+                    memcpy(msg.data(), &size, sizeof(size));
+                    if (!sock->send_owned(std::move(msg))) {
+                        return;
+                    }
+                    break;
                 }
                 std::vector<uint8_t> response;
                 if (!server.get_tensor(request, response)) {

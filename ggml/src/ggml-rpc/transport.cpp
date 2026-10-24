@@ -23,6 +23,7 @@
 #include <thread>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <vector>
 #include <algorithm>
 #include <optional>
@@ -174,7 +175,77 @@ struct socket_t::impl {
     bool                              ra_eof   = false;
     bool                              ra_stop  = false;
     bool                              ra_active = false;
+
+    // fork: write-behind (TCP only), see socket_t::start_write_behind
+    void wb_start();
+    void wb_loop();
+    bool send_raw(const void * data, size_t size);
+    std::thread                        wb_thread;
+    std::mutex                         wb_mutex;
+    std::condition_variable            wb_cv_work;
+    std::condition_variable            wb_cv_idle;
+    struct wb_msg {
+        std::vector<uint8_t>  owned;          // sent first (a whole message, or the header of a deferred one)
+        const void *          ext     = nullptr;
+        size_t                ext_len = 0;
+        std::function<void()> wait;           // run on the writer before sending (e.g. wait for a D2H copy)
+        std::function<void()> done;           // run on the writer after sending (e.g. recycle the buffer)
+    };
+    std::deque<wb_msg>                 wb_queue;
+    std::vector<std::vector<uint8_t>>  wb_pool;
+    bool                               wb_busy   = false;
+    bool                               wb_failed = false;
+    bool                               wb_stop   = false;
+    bool                               wb_active = false;
 };
+
+void socket_t::impl::wb_start() {
+    if (use_rdma || wb_active) {
+        return;
+    }
+    wb_active = true;
+    wb_thread = std::thread([this] { wb_loop(); });
+}
+
+void socket_t::impl::wb_loop() {
+    for (;;) {
+        wb_msg msg;
+        {
+            std::unique_lock<std::mutex> lock(wb_mutex);
+            wb_cv_work.wait(lock, [this] { return !wb_queue.empty() || wb_stop; });
+            if (wb_queue.empty()) {
+                break;
+            }
+            msg = std::move(wb_queue.front());
+            wb_queue.pop_front();
+            wb_busy = true;
+        }
+        if (msg.wait) {
+            msg.wait();
+        }
+        bool ok = send_raw(msg.owned.data(), msg.owned.size());
+        if (ok && msg.ext_len > 0) {
+            ok = send_raw(msg.ext, msg.ext_len);
+        }
+        if (msg.done) {
+            msg.done();
+        }
+        std::lock_guard<std::mutex> lock(wb_mutex);
+        wb_busy = false;
+        if (!ok) {
+            wb_failed = true;
+            for (auto & m : wb_queue) { // the owed hooks still run (they own buffers / events)
+                if (m.wait) m.wait();
+                if (m.done) m.done();
+            }
+            wb_queue.clear();
+        }
+        if (wb_pool.size() < 2 && msg.owned.capacity() >= (1u << 20)) {
+            wb_pool.push_back(std::move(msg.owned)); // keep the capacity: the next reply of the same size skips the zero-fill
+        }
+        wb_cv_idle.notify_all();
+    }
+}
 
 void socket_t::impl::ra_start(size_t max_bytes) {
     if (use_rdma || ra_active || max_bytes == 0) {
@@ -234,6 +305,14 @@ bool socket_t::impl::ra_recv(void * data, size_t size) {
 }
 
 socket_t::impl::~impl() {
+    if (wb_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(wb_mutex);
+            wb_stop = true;
+        }
+        wb_cv_work.notify_all();
+        wb_thread.join(); // drains the queue first: queued replies are owed to the peer
+    }
     if (ra_thread.joinable()) {
         {
             std::lock_guard<std::mutex> lock(ra_mutex);
@@ -621,6 +700,18 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 #endif // GGML_RPC_RDMA
 
 bool socket_t::impl::send_data(const void * data, size_t size) {
+    if (wb_active) {
+        // a direct send must not overtake (or interleave with) a queued reply
+        std::unique_lock<std::mutex> lock(wb_mutex);
+        wb_cv_idle.wait(lock, [this] { return (wb_queue.empty() && !wb_busy) || wb_failed; });
+        if (wb_failed) {
+            return false;
+        }
+    }
+    return send_raw(data, size);
+}
+
+bool socket_t::impl::send_raw(const void * data, size_t size) {
     LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
@@ -777,6 +868,64 @@ void socket_t::update_caps(const uint8_t * remote_caps) {
 
 void socket_t::start_read_ahead(size_t max_bytes) {
     pimpl->ra_start(max_bytes);
+}
+
+void socket_t::start_write_behind() {
+    pimpl->wb_start();
+}
+
+void socket_t::stop_write_behind() {
+    if (pimpl->wb_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(pimpl->wb_mutex);
+            pimpl->wb_stop = true;
+        }
+        pimpl->wb_cv_work.notify_all();
+        pimpl->wb_thread.join(); // drains the queue (or runs its hooks if the peer is gone)
+    }
+}
+
+bool socket_t::write_behind_active() const {
+    return pimpl->wb_active;
+}
+
+std::vector<uint8_t> socket_t::wb_acquire() {
+    std::lock_guard<std::mutex> lock(pimpl->wb_mutex);
+    if (pimpl->wb_pool.empty()) {
+        return {};
+    }
+    std::vector<uint8_t> buf = std::move(pimpl->wb_pool.back());
+    pimpl->wb_pool.pop_back();
+    return buf;
+}
+
+bool socket_t::send_owned(std::vector<uint8_t> && msg) {
+    if (!pimpl->wb_active) {
+        return pimpl->send_data(msg.data(), msg.size());
+    }
+    std::lock_guard<std::mutex> lock(pimpl->wb_mutex);
+    if (pimpl->wb_failed) {
+        return false;
+    }
+    pimpl->wb_queue.push_back({std::move(msg), nullptr, 0, nullptr, nullptr});
+    pimpl->wb_cv_work.notify_one();
+    return true;
+}
+
+bool socket_t::send_deferred(std::vector<uint8_t> && head, const void * data, size_t size,
+                             std::function<void()> wait, std::function<void()> done) {
+    if (!pimpl->wb_active) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(pimpl->wb_mutex);
+    if (pimpl->wb_failed) {
+        if (wait) wait();
+        if (done) done();
+        return false;
+    }
+    pimpl->wb_queue.push_back({std::move(head), data, size, std::move(wait), std::move(done)});
+    pimpl->wb_cv_work.notify_one();
+    return true;
 }
 
 const char * socket_t::transport_name() const {

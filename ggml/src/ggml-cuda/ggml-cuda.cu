@@ -2653,6 +2653,13 @@ static bool ggml_cuda_async_foreign_copy_enabled() {
     return enabled;
 }
 
+// pageable set_tensor_async sources from this size on are staged (GGML_CUDA_STAGE_MIN_KB, default 1024; an RPC
+// server queuing its client's inputs behind a running graph wants 0)
+static size_t ggml_cuda_stage_min_bytes() {
+    static const size_t min_bytes = getenv("GGML_CUDA_STAGE_MIN_KB") ? (size_t) atoll(getenv("GGML_CUDA_STAGE_MIN_KB")) << 10 : (size_t) 1 << 20;
+    return min_bytes;
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -2661,7 +2668,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     // fork: from pageable memory cudaMemcpyAsync blocks the host until the stream reaches the copy - with the stream
     // waiting on a remote stage that is the whole stage. Large pageable sources go through a pinned staging buffer.
-    if (ggml_cuda_async_foreign_copy_enabled() && size >= (1u << 20)) {
+    if (ggml_cuda_async_foreign_copy_enabled() && size >= ggml_cuda_stage_min_bytes()) {
         cudaPointerAttributes attr;
         const bool pageable = cudaPointerGetAttributes(&attr, data) != cudaSuccess || attr.type == cudaMemoryTypeUnregistered;
         (void) cudaGetLastError();
