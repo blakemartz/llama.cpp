@@ -2119,6 +2119,21 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 }
 
 // returns true when the copy callback handled the copy (it may then have copied only part of the tensor)
+// fork: GGML_SCHED_LOG_SYNC=<ms> - log scheduler host waits on events longer than <ms>, with the site and tensor
+static void ggml_backend_sched_event_sync_logged(ggml_backend_event_t ev, const char * site, const struct ggml_tensor * t) {
+    static const double thr_ms = getenv("GGML_SCHED_LOG_SYNC") ? atof(getenv("GGML_SCHED_LOG_SYNC")) : -1.0;
+    if (thr_ms < 0) {
+        ggml_backend_event_synchronize(ev);
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    ggml_backend_event_synchronize(ev);
+    const double ms = (ggml_time_us() - t0) / 1000.0;
+    if (ms >= thr_ms) {
+        GGML_LOG_WARN("sched sync %s: %.1f ms (%s, %s)\n", site, ms, ev->device ? ggml_backend_dev_name(ev->device) : "?", t ? t->name : "-");
+    }
+}
+
 static bool ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     if (sched->n_copies > 1 && ggml_backend_sched_is_user_input(input)) {
         return false; // already uploaded by ggml_backend_sched_compute_splits
@@ -2132,7 +2147,7 @@ static bool ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            ggml_backend_sched_event_sync_logged(sched->events[split_backend_id][sched->cur_copy], "user-input", input);
         } else {
             ggml_backend_synchronize(split_backend);
         }
@@ -2163,7 +2178,7 @@ static bool ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
         ggml_backend_synchronize(input_backend);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            ggml_backend_sched_event_sync_logged(sched->events[split_backend_id][sched->cur_copy], "sync-copy", input);
         } else {
             ggml_backend_synchronize(split_backend);
         }
@@ -2178,7 +2193,7 @@ static void ggml_backend_sched_upload_user_inputs(ggml_backend_sched_t sched) {
     const int next_copy = (sched->cur_copy + 1) % sched->n_copies;
     for (int b = 0; b < sched->n_backends; b++) {
         if (sched->input_events[b][next_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->input_events[b][next_copy]);
+            ggml_backend_sched_event_sync_logged(sched->input_events[b][next_copy], "upload-next", NULL);
         }
     }
     bool uploaded[GGML_SCHED_MAX_BACKENDS] = { false };
@@ -2249,7 +2264,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
             if (prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
                 if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+                    ggml_backend_sched_event_sync_logged(sched->events[prev_backend_id][sched->cur_copy], "prev-split", NULL);
                 } else {
                     ggml_backend_synchronize(sched->backends[prev_backend_id]);
                 }

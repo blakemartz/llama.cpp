@@ -87,6 +87,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -2647,12 +2648,112 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// fork: GGML_CUDA_ASYNC_FOREIGN_COPY=1 (2026-10-24) - asynchronous copy from a non-CUDA backend that has
+// get_tensor_async and events (RPC) into a CUDA tensor. Without it ggml_backend_sched falls back to synchronizing the
+// source backend and a blocking get/set, so with an RPC stage in front of a CUDA one the host thread waits out the
+// whole remote stage of every ubatch and cannot queue the next one: pipeline parallelism stays at depth 1.
+// Here the get is queued on the source backend into a pinned staging buffer, followed by a fresh source event (an
+// RPC event is a marker in the dispatcher queue, so creating it records it). On this stream a host function waits
+// for that event and frees it, then the staging buffer is copied to the device. The host thread returns at once.
+// Staging buffers come from a per-device pool and are reused only once the device copy out of them is done (never
+// waited for: keying them by destination address made the host wait whenever the allocator reused an address
+// within one graph, behind a stream that is itself waiting on the remote stage).
+struct ggml_cuda_foreign_stage {
+    void *      host = nullptr;
+    size_t      size = 0;
+    cudaEvent_t done = nullptr; // recorded after the copy out of host
+};
+
+static void CUDART_CB ggml_cuda_foreign_wait_cb(void * data) {
+    ggml_backend_event_t ev = (ggml_backend_event_t) data;
+    ggml_backend_event_synchronize(ev);
+    ggml_backend_event_free(ev);
+}
+
+static bool ggml_backend_cuda_cpy_tensor_async_foreign(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    static const bool enabled = getenv("GGML_CUDA_ASYNC_FOREIGN_COPY") != nullptr;
+    if (!enabled || !ggml_backend_is_cuda(backend_dst) || ggml_backend_is_cuda(backend_src)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (buf_src == nullptr || buf_dst == nullptr || !ggml_backend_buffer_is_cuda(buf_dst)) {
+        return false;
+    }
+    // a source in host memory (a CPU split's output) is snapshotted into the staging buffer: the source buffer is
+    // rewritten by the next graph while this stream may still be waiting on an earlier stage
+    const bool src_host = ggml_backend_buffer_is_host(buf_src);
+    if (!src_host && backend_src->iface.get_tensor_async == nullptr) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend_dst->context;
+    if (((ggml_backend_cuda_buffer_context *) buf_dst->context)->device != cuda_ctx->device) {
+        return false;
+    }
+    ggml_backend_dev_t dev_src = ggml_backend_get_device(backend_src);
+    if (!src_host && (dev_src == nullptr || dev_src->iface.event_new == nullptr || dev_src->iface.event_synchronize == nullptr)) {
+        return false;
+    }
+
+    static std::mutex mutex;
+    static std::vector<std::unique_ptr<ggml_cuda_foreign_stage>> pools[GGML_CUDA_MAX_DEVICES];
+    const size_t nbytes = ggml_nbytes(dst);
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_foreign_stage * st = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto & pool = pools[cuda_ctx->device];
+        // smallest free buffer that fits; none -> a new one (never grow one: cudaFreeHost synchronizes the device)
+        ggml_cuda_foreign_stage * best = nullptr;
+        for (auto & cand : pool) {
+            if (cand->size < nbytes || (best != nullptr && cand->size >= best->size)) {
+                continue;
+            }
+            if (cudaEventQuery(cand->done) != cudaSuccess) {
+                continue; // still in flight (cudaErrorNotReady)
+            }
+            best = cand.get();
+        }
+        (void) cudaGetLastError(); // clear the cudaErrorNotReady of the queries
+        if (best == nullptr) {
+            pool.push_back(std::make_unique<ggml_cuda_foreign_stage>());
+            best = pool.back().get();
+            CUDA_CHECK(cudaEventCreateWithFlags(&best->done, cudaEventDisableTiming));
+        }
+        st = best;
+    }
+    if (st->host == nullptr) {
+        CUDA_CHECK(cudaMallocHost(&st->host, nbytes));
+        st->size = nbytes;
+    }
+
+    if (src_host) {
+        ggml_backend_synchronize(backend_src);
+        memcpy(st->host, src->data, nbytes);
+    } else {
+        ggml_backend_tensor_get_async(backend_src, src, st->host, 0, nbytes);
+        ggml_backend_event_t ev = ggml_backend_event_new(dev_src); // recorded behind the get
+        if (ev == nullptr) {
+            ggml_backend_synchronize(backend_src);
+        } else {
+            CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), ggml_cuda_foreign_wait_cb, ev));
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dst->data, st->host, nbytes, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(cudaEventRecord(st->done, cuda_ctx->stream()));
+    return true;
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
-        return false;
+        return ggml_backend_cuda_cpy_tensor_async_foreign(backend_src, backend_dst, src, dst);
     }
 
     if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
