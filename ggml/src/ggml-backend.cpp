@@ -926,6 +926,7 @@ struct ggml_backend_sched_split {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool relax_split_barrier; // fork: GGML_SCHED_RELAX_SPLIT_BARRIER, per scheduler (ggml_backend_sched_set_relax_split_barrier)
 
     int n_backends;
 
@@ -2267,7 +2268,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // takes this path: the MoE CPU assist stages its activations and ids to the CPU early precisely so
         // the CPU half has no cross-device inputs, which left it synchronising on the GPU split before it
         // and serialised the very work it was meant to overlap (measured 2026-09-18, twice).
-        static const bool relax_barrier = getenv("GGML_SCHED_RELAX_SPLIT_BARRIER") != NULL;
+        const bool relax_barrier = sched->relax_split_barrier;
         auto sync_prev_split = [&]() {
             if (relax_barrier && prev_backend_id >= 0 &&
                     sched->bufts[prev_backend_id] != sched->bufts[split_backend_id]) {
@@ -2424,6 +2425,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
+    sched->relax_split_barrier = getenv("GGML_SCHED_RELAX_SPLIT_BARRIER") != NULL;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
     // pipeline depth is a memory/throughput trade (n_copies staging tensors per non-weight split input), and the
@@ -2606,6 +2608,11 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_set_relax_split_barrier(ggml_backend_sched_t sched, bool relax) {
+    GGML_ASSERT(sched);
+    sched->relax_split_barrier = relax;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

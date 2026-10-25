@@ -1264,6 +1264,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
+                // fork (debug): LLAMA_DEBUG_DFLASH_NAN=1 - non-finite target features handed to the drafter
+                {
+                    static const bool dbg_nan = getenv("LLAMA_DEBUG_DFLASH_NAN") != nullptr;
+                    if (dbg_nan) {
+                        size_t n_bad = 0, first = SIZE_MAX;
+                        for (size_t j = 0; j < features_buf.size(); ++j) {
+                            if (!std::isfinite(features_buf[j])) { if (first == SIZE_MAX) { first = j; } n_bad++; }
+                        }
+                        if (n_bad > 0) {
+                            LOG_WRN("dflash-nan: target features seq %d rows %d..%d (pos %d, n_batch %d) bad %zu/%zu first row %zu layer %zu\n",
+                                    seq_id, i_batch_beg[seq_id] + offset, i_batch_beg[seq_id] + offset + n_chunk - 1,
+                                    batch_in.tokens[i_batch_beg[seq_id] + offset].pos[0], (int) batch_in.size(), n_bad, features_buf.size(),
+                                    first / n_embd_enc, (first % n_embd_enc) / n_embd_tgt);
+                        }
+                    }
+                }
 
                 batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
@@ -1435,6 +1451,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // prefix survives verification, which is what a draft token's cost should be weighed against
                 const float   p_cum_min = dp.p_cum_min >= 0.0f ? dp.p_cum_min : params.p_cum_min;
                 const float * conf  = p_min > 0.0f || p_cum_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                {   // fork (debug): LLAMA_DEBUG_DFLASH_NAN=1 - non-finite DSpark confidences (NaN draft logits upstream of them)
+                    static const bool dbg_nan = getenv("LLAMA_DEBUG_DFLASH_NAN") != nullptr;
+                    if (dbg_nan && conf) {
+                        int n_bad = 0;
+                        for (int32_t i = 0; i < n_block_tokens; ++i) {
+                            n_bad += !std::isfinite(conf[(size_t) (beg + i) * n_embd_dec]);
+                        }
+                        if (n_bad > 0) {
+                            LOG_WRN("dflash-nan: DSpark conf seq %d block beg %d: %d/%d non-finite\n", seq_id, beg, n_bad, n_block_tokens);
+                        }
+                    }
+                }
                 float         p_cum = 1.0f;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;

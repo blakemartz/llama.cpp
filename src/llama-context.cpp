@@ -809,6 +809,13 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+
+    // fork: LLAMA_DRAFT_STRICT_BARRIER=1 - the DFlash/DSpark drafter keeps the full split barrier under
+    // GGML_SCHED_RELAX_SPLIT_BARRIER (tuned for the target's split chain; the 2026-10-24 drafter-NaN race needs it relaxed)
+    if (model.arch == LLM_ARCH_DFLASH && getenv("LLAMA_DRAFT_STRICT_BARRIER") != nullptr) {
+        ggml_backend_sched_set_relax_split_barrier(sched.get(), false);
+        LLAMA_LOG_INFO("%s: drafter scheduler keeps the full split barrier (LLAMA_DRAFT_STRICT_BARRIER)\n", __func__);
+    }
 }
 
 void llama_context::sched_reserve() {

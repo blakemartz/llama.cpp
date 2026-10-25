@@ -374,6 +374,8 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
     // Set a callback to be called for each resulting node during graph compute
+    // fork: override GGML_SCHED_RELAX_SPLIT_BARRIER for one scheduler
+    GGML_API void                 ggml_backend_sched_set_relax_split_barrier(ggml_backend_sched_t sched, bool relax);
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
     // Set a callback to be called when the inputs weights of a split are being copied

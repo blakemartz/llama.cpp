@@ -87,6 +87,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include <unordered_map>
 #include <cstdarg>
 #include <cstdio>
@@ -107,6 +109,12 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
+    // fork (debug): GGML_CUDA_ERROR_SLEEP=<s> holds the process before the abort, so a GPU coredump
+    // (CUDA_ENABLE_COREDUMP_ON_EXCEPTION) that the driver is still writing is not cut off
+    if (const char * s = getenv("GGML_CUDA_ERROR_SLEEP")) {
+        GGML_LOG_ERROR("  sleeping %s s before abort (GGML_CUDA_ERROR_SLEEP)\n", s);
+        std::this_thread::sleep_for(std::chrono::seconds(atoi(s)));
+    }
     // abort with GGML_ABORT to get a stack trace
     GGML_ABORT(GGML_CUDA_NAME " error");
 }
