@@ -1052,7 +1052,25 @@ void ggml_gallocr_reserve_n_size(
 }
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
-    return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+    if (ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false)) {
+        return true;
+    }
+    // fork: a sticky entry seeded by a small graph (a short first prompt) grows each tensor to <grow> x its size
+    // when a large one arrives, which can exceed the load-time worst-case buffer and fail (CUDA OOM, 2026-10-25:
+    // 2.4K then 24.6K prompt -> 4450 MiB on CUDA0, every long request a 500). Forget this topology's sizes and
+    // retry once at the tensors' own sizes, which the worst-case reservation already covers.
+    if (galloc->sticky_grow > 1.0f && galloc->sticky_cur) {
+        struct gallocr_sticky * st = galloc->sticky_cur;
+        GGML_LOG_WARN("%s: sticky reservation did not fit, retrying at the graph's own sizes\n", __func__);
+        memset(st->node_size, 0, sizeof(size_t) * (st->n_nodes > 0 ? st->n_nodes : 1));
+        memset(st->leaf_size, 0, sizeof(size_t) * (st->n_leafs > 0 ? st->n_leafs : 1));
+        const float grow = galloc->sticky_grow;
+        galloc->sticky_grow = 1.0f;
+        const bool ok = ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+        galloc->sticky_grow = grow;
+        return ok;
+    }
+    return false;
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
