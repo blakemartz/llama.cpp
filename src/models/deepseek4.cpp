@@ -2038,6 +2038,17 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_engram(
 // cell_prev (I32, for get_rows) and selects per token with odd_f; the group RoPE position is pos_grp.
 // Every tensor is [n_tokens]-shaped so the graph shape does not depend on the token parity split.
 // Mask shapes mirror the window mask so the two concatenate: [n_kv, n_tokens/n_stream, 1, n_stream].
+
+// fork (2026-10-25): decode/verify ubatches attend [window ; the top-k compressed rows each query selected]
+// gathered with get_rows, instead of [window ; the whole compressed stream]. The concat of the whole stream
+// copied every source layer's compressed K once per consuming layer per step (~25 MB at 24.6K depth, ~6 % of a
+// decode step, linear in depth). Only for small ubatches whose selections are smaller than the stream; prefill
+// keeps the concat. DSV41_NO_TOPK_GATHER=1 keeps the concat everywhere (A/B inside one build).
+static bool dsv41_topk_gather(int64_t n_top_k, int64_t n_tokens, int64_t n_kv_comp) {
+    static const bool off = getenv("DSV41_NO_TOPK_GATHER") != nullptr;
+    return !off && n_top_k > 0 && n_tokens <= 16 && n_top_k*n_tokens < n_kv_comp;
+}
+
 class llm_graph_input_dsv41 : public llm_graph_input_i {
 public:
     llm_graph_input_dsv41(const llama_cparams & cparams, const llama_kv_cache_dsv41_context * mctx) :
@@ -2057,6 +2068,15 @@ public:
         if (live(k_idxs_comp)) { ctx_comp->set_input_k_idxs(k_idxs_comp, ubatch); }
         if (live(k_idxs_idx))  { mctx->get_idx()->set_input_k_idxs(k_idxs_idx, ubatch); }
         if (live(kq_mask_r1))  { ctx_comp->set_input_kq_mask(kq_mask_r1, ubatch, cparams.causal_attn); }
+        if (live(kq_blk)) {
+            // gathered row j belongs to query j / n_top_k: every query sees only its own selection
+            const int64_t n_rows = kq_blk->ne[0], n_q = kq_blk->ne[1];
+            std::vector<float> b((size_t) (n_rows*n_q), -INFINITY);
+            for (int64_t t = 0; t < n_q; ++t) {
+                for (int64_t j = t*n_top_k; j < (t + 1)*n_top_k; ++j) { b[(size_t) (t*n_rows + j)] = 0.0f; }
+            }
+            ggml_backend_tensor_set(kq_blk, b.data(), 0, b.size()*sizeof(float));
+        }
         if (!live(k_idxs_comp) || !live(cell_prev) || !live(pos_grp) || !live(odd_f) || !live(kq_mask_r2)) {
             return;
         }
@@ -2136,6 +2156,8 @@ public:
         res &= kq_mask_r1 ->ne[0] == (int64_t) mctx_new->get_comp()->get_n_kv();
         res &= kq_mask_win->ne[1] == n_tokens && kq_mask_win->ne[3] == 1;
         res &= kq_mask_r1 ->ne[1] == n_tokens && kq_mask_r1 ->ne[3] == 1;
+        res &= (kq_blk != nullptr) ==
+               (n_tokens > 1 && dsv41_topk_gather(n_top_k, n_tokens, (int64_t) mctx_new->get_comp()->get_n_kv()));
         // CED bounded replay: a graph built for the full-depth path cannot serve a ubatch that subsets
         // the decoder rows, and vice versa
         {
@@ -2158,6 +2180,9 @@ public:
     ggml_tensor * cell_prev   = nullptr; // I32 [n_tokens]  cell of the even partner (own cell for even tokens)
     ggml_tensor * pos_grp     = nullptr; // I32 [n_tokens]  group RoPE position (pos - 1 for odd tokens)
     ggml_tensor * odd_f       = nullptr; // F32 [1, n_tokens] 1.0 for odd tokens
+
+    ggml_tensor * kq_blk      = nullptr; // F32 [n_top_k*n_tokens, n_tokens] block mask of the top-k gather (n_tokens > 1)
+    int64_t       n_top_k     = 0;
 
     const llama_cparams cparams;
     const llama_kv_cache_dsv41_context * mctx;
@@ -2317,6 +2342,11 @@ llm_graph_input_dsv41 * llama_model_deepseek4::graph_v41::build_inp_dsv41() cons
     inp->cell_prev = vec(GGML_TYPE_I32, n_tokens);
     inp->pos_grp   = vec(GGML_TYPE_I32, n_tokens);
     inp->odd_f     = vec(GGML_TYPE_F32, 1, n_tokens);
+
+    inp->n_top_k = hparams.indexer_top_k;
+    if (n_tokens > 1 && dsv41_topk_gather(inp->n_top_k, n_tokens, ctx_comp->get_n_kv())) {
+        inp->kq_blk = vec(GGML_TYPE_F32, inp->n_top_k*n_tokens, n_tokens);
+    }
 
     return (llm_graph_input_dsv41 *) res->add_input(std::move(inp));
 }
@@ -2586,6 +2616,8 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
     ggml_tensor * k_all   = ctx_win->get_k(ctx0, il);                                              // [n_embd_head, 1, n_kv_win, 1]
     ggml_tensor * kq_mask = inp->kq_mask_win;
     GGML_ASSERT(k_all->ne[3] == 1 && "V4.1: single stream");
+    ggml_tensor * k_win_chk = nullptr, * m_win_chk = nullptr, * k_comp_chk = nullptr, * m_comp_chk = nullptr;
+    bool gathered = false;
 
     if (ratio != 0) {
         // ONE softmax over [window ; compressed] with the sinks (the reference sparse_attn over
@@ -2604,13 +2636,40 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
         if (!no_idx_topk && hparams.is_index_source_impl[il]) {
             csa2_top_k = build_indexer_top_k_v41(model, inp, qr, cur, inp_pos, il);
         }
-        if (csa2_top_k) {
-            m_comp = build_top_k_mask(m_comp, csa2_top_k, "csa2_kq_mask_top_k", il);
-        }
+        const int64_t n_comp = m_comp->ne[0];
+        const int64_t n_top  = csa2_top_k ? csa2_top_k->ne[0] : 0;
+        k_win_chk = k_all; m_win_chk = kq_mask; k_comp_chk = k_comp; m_comp_chk = m_comp;
+        if (csa2_top_k && dsv41_topk_gather(n_top, nt, n_comp) &&
+                (nt == 1 || (inp->kq_blk && inp->kq_blk->ne[1] == nt))) {
+            // fork: attend [window ; each query's top-k rows] (see dsv41_topk_gather). Gathered row j is
+            // query j/n_top's selection; its mask is the compressed visibility at that index, plus the block
+            // mask hiding the other queries' rows. Same visible set per query, so the same attention.
+            ggml_tensor * idx = ggml_reshape_1d(ctx0, csa2_top_k, n_top*nt);
+            ggml_tensor * k_sel = ggml_get_rows(ctx0, ggml_view_2d(ctx0, k_comp, k_comp->ne[0], n_comp, k_comp->nb[2], 0), idx);
+            if (k_sel->type != k_all->type) { k_sel = ggml_cast(ctx0, k_sel, k_all->type); }
+            k_sel = ggml_reshape_3d(ctx0, k_sel, k_sel->ne[0], 1, n_top*nt);                            // [n_embd_head, 1, n_top*nt]
 
-        if (k_comp->type != k_all->type) { k_comp = ggml_cast(ctx0, k_comp, k_all->type); }
-        k_all   = ggml_concat(ctx0, k_all, k_comp, 2);
-        kq_mask = ggml_concat(ctx0, kq_mask, m_comp, 0);
+            ggml_tensor * m_t = nt == 1 ? ggml_reshape_2d(ctx0, m_comp, 1, n_comp)
+                                        : ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, m_comp, n_comp, nt)));
+            ggml_tensor * m_sel = ggml_get_rows(ctx0, m_t, idx);                                        // F32 [nt, n_top*nt]
+            m_sel = nt == 1 ? ggml_reshape_2d(ctx0, m_sel, n_top, 1)
+                            : ggml_add(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, m_sel)), inp->kq_blk);   // [n_top*nt, nt]
+            if (m_sel->type != kq_mask->type) { m_sel = ggml_cast(ctx0, m_sel, kq_mask->type); }
+            cb(k_sel, "csa2_k_sel", il);
+            cb(m_sel, "csa2_kq_mask_sel", il);
+
+            k_all   = ggml_concat(ctx0, k_all, k_sel, 2);
+            kq_mask = ggml_concat(ctx0, kq_mask, m_sel, 0);
+            gathered = true;
+        } else {
+            if (csa2_top_k) {
+                m_comp = build_top_k_mask(m_comp, csa2_top_k, "csa2_kq_mask_top_k", il);
+            }
+
+            if (k_comp->type != k_all->type) { k_comp = ggml_cast(ctx0, k_comp, k_all->type); }
+            k_all   = ggml_concat(ctx0, k_all, k_comp, 2);
+            kq_mask = ggml_concat(ctx0, kq_mask, m_comp, 0);
+        }
         cb(k_all,   "csa2_k_all",   il);
         cb(kq_mask, "csa2_kq_mask", il);
     }
@@ -2629,6 +2688,26 @@ ggml_tensor * llama_model_deepseek4::graph_v41::build_attention_v41(
         : 0;
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
     cb(out, ratio != 0 ? "attn_csa2" : "attn_window", il);
+
+    // fork debug: DSV41_TOPK_CHECK=1 also runs the concat path on the same q/K (bounded and unbounded) and
+    // emits per-token sum((g-c)^2), sum((c0-c)^2), sum(c^2) as csa2_chk_{dg,d0,n}-<il> for the dump tool
+    static const bool topk_check = getenv("DSV41_TOPK_CHECK") != nullptr;
+    if (topk_check && gathered) {
+        ggml_tensor * mc = build_top_k_mask(m_comp_chk, csa2_top_k, "csa2_chk_mask", il);
+        ggml_tensor * kc = k_comp_chk->type != k_win_chk->type ? ggml_cast(ctx0, k_comp_chk, k_win_chk->type) : k_comp_chk;
+        kc = ggml_concat(ctx0, k_win_chk, kc, 2);
+        mc = ggml_concat(ctx0, m_win_chk, mc, 0);
+        ggml_tensor * oc  = build_attn_mha(q, kc, kc, nullptr, mc, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+        ggml_tensor * oc0 = build_attn_mha(q, kc, kc, nullptr, mc, layer.attn_sinks, nullptr, 0,        kq_scale, il);
+        auto rows = [&](ggml_tensor * t) { return ggml_reshape_2d(ctx0, ggml_cont(ctx0, t), ggml_nelements(t)/nt, nt); };
+        ggml_tensor * g2 = rows(out), * c2 = rows(oc), * c02 = rows(oc0);
+        ggml_tensor * dg = ggml_sum_rows(ctx0, ggml_sqr(ctx0, ggml_sub(ctx0, g2,  c2)));
+        ggml_tensor * d0 = ggml_sum_rows(ctx0, ggml_sqr(ctx0, ggml_sub(ctx0, c02, c2)));
+        ggml_tensor * nn = ggml_sum_rows(ctx0, ggml_sqr(ctx0, c2));
+        cb(dg, "csa2_chk_dg", il); cb(d0, "csa2_chk_d0", il); cb(nn, "csa2_chk_n", il);
+        cb(g2, "csa2_chk_g", il); cb(c2, "csa2_chk_c", il);
+        ggml_build_forward_expand(gf, dg); ggml_build_forward_expand(gf, d0); ggml_build_forward_expand(gf, nn);
+    }
 
     out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
     out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
