@@ -8,8 +8,11 @@
 static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
     const int64_t row = blockIdx.x;
 
+    // fork: start at column 0 like the CPU backend (ggml_vec_argmax_f32), not -1: a row with no value above -FLT_MAX
+    // (all NaN, or all -inf) returned -1, and a get_rows on that index reads before its source - the DSpark Markov
+    // head's get_rows(w1, argmax(col)) faulted this way on NaN draft logits (2026-10-24)
     float maxval = -FLT_MAX;
-    int   argmax = -1;
+    int   argmax = 0;
     const float * rowx = x + row * ncols;
 
     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
