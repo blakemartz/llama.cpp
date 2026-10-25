@@ -2562,8 +2562,13 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, const lla
         GGML_ASSERT(n_dec > 0 && nfloats % n_dec == 0);
         const size_t row_floats = nfloats / n_dec;
 
+        // fork: on the producing backend's stream, then wait for it. A plain ggml_backend_tensor_get (CUDA: a copy on
+        // cudaStreamPerThread) is not ordered after this graph's kernels, which are still queued here; once nothing else
+        // makes the host wait mid-graph (device expert gather + async foreign copies + relaxed split barrier, 2026-10-24)
+        // it read the tapped decoder rows before they were written, and the drafter ingested stale bytes as features
         std::vector<float> tmp(nfloats);
-        ggml_backend_tensor_get(t, tmp.data(), 0, nbytes);
+        ggml_backend_tensor_get_async(backend, t, tmp.data(), 0, nbytes);
+        ggml_backend_synchronize(backend);
         for (size_t j = 0; j < n_dec; ++j) {
             const size_t dst_offset = (token_offset + (size_t) dec_rows[j]) * row_floats;
             GGML_ASSERT(dst_offset + row_floats <= embd_layer_inp[il].size);
