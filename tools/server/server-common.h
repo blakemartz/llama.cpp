@@ -413,6 +413,14 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // fork: wall time per speculative phase (us), summed over the request; exposed as timings.spec_*_ms
+    int64_t t_spec_draft_us  = 0; // common_speculative_draft (draft model pass)
+    int64_t t_spec_ckpt_us   = 0; // post-draft checkpoint / draft-ctx restore block
+    int64_t t_spec_sample_us = 0; // sample_and_accept over the verify batch outputs
+    int64_t t_spec_accept_us = 0; // common_speculative_accept (drafter state update)
+    int64_t t_tgt_decode_us  = 0; // target llama_process + sync for batches carrying this slot's generation
+    int64_t n_tgt_decode     = 0;
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

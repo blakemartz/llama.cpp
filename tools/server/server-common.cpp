@@ -156,6 +156,14 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"]   = n_draft_accepted;
         base["draft_n_verif_steps"] = n_draft_verif_steps;
     }
+    if (n_tgt_decode > 0) {
+        base["spec_draft_ms"]  = t_spec_draft_us  / 1e3;
+        base["spec_ckpt_ms"]   = t_spec_ckpt_us   / 1e3;
+        base["spec_sample_ms"] = t_spec_sample_us / 1e3;
+        base["spec_accept_ms"] = t_spec_accept_us / 1e3;
+        base["tgt_decode_ms"]  = t_tgt_decode_us  / 1e3;
+        base["tgt_decode_n"]   = n_tgt_decode;
+    }
 
     return base;
 }

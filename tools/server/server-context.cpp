@@ -3809,11 +3809,15 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t t0 = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            const int64_t dt = ggml_time_us() - t0;
+            iterate(drafting, [&](server_slot & slot) { slot.stats.t_spec_draft_us += dt; });
         }
 
+        const int64_t t_ckpt0 = ggml_time_us();
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
@@ -3861,6 +3865,11 @@ private:
                 }
             }
         });
+
+        {
+            const int64_t dt = ggml_time_us() - t_ckpt0;
+            iterate(drafting, [&](server_slot & slot) { slot.stats.t_spec_ckpt_us += dt; });
+        }
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -4603,12 +4612,22 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t t_dec0 = ggml_time_us();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        {
+            const int64_t dt = ggml_time_us() - t_dec0;
+            for (auto & slot : slots) {
+                if (slot.is_processing() && slot.state == SLOT_STATE_GENERATING) {
+                    slot.stats.t_tgt_decode_us += dt;
+                    slot.stats.n_tgt_decode    += 1;
+                }
+            }
+        }
 
         if (ret != 0) {
             {
@@ -4854,6 +4873,7 @@ private:
                 // drafters that fill no distribution fall back here
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
+                const int64_t t_smp0 = ggml_time_us();
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
@@ -4869,6 +4889,7 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+                slot.stats.t_spec_sample_us += ggml_time_us() - t_smp0;
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
@@ -4910,7 +4931,11 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                {
+                    const int64_t t_acc0 = ggml_time_us();
+                    common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                    slot.stats.t_spec_accept_us += ggml_time_us() - t_acc0;
+                }
 
                 slot.spec_draft = std::move(accepted);
             }
