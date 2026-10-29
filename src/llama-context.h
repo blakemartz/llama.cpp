@@ -440,6 +440,7 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+    int  shexp_overlap_built = -1; // fork: the LLAMA_SHEXP_OVERLAP state the previous graph was built with
 
     // one-shot log guard for the MoE CPU assist pin count
     int n_moe_cpu_pinned_logged = 0;

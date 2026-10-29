@@ -1639,7 +1639,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // fork: a change of the LLAMA_SHEXP_OVERLAP state changes the topology, so it forbids the reuse
+    const int shexp_overlap = llama_shexp_overlap_refresh();
+    const bool shexp_overlap_same = shexp_overlap == shexp_overlap_built;
+    shexp_overlap_built = shexp_overlap;
+
+    if (!graph_reuse_disable && shexp_overlap_same && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running

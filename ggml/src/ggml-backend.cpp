@@ -1687,6 +1687,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
 
+            // fork: GGML_TENSOR_FLAG_SPLIT_BEFORE asks for a split boundary here even on the same backend, so that
+            // compute_splits can copy the next split's inputs before this one is submitted (LLAMA_SHEXP_OVERLAP)
+            if ((node->flags & GGML_TENSOR_FLAG_SPLIT_BEFORE) && i > split->i_start) {
+                need_new_split = true;
+            }
+
             if (node_backend_id != cur_backend_id || need_new_split) {
                 split->i_end = i;
                 i_split++;
@@ -2247,6 +2253,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     sched->n_input_copies = 0;
 
+    // fork: splits whose inputs a GGML_TENSOR_FLAG_SPLIT_BEFORE split already copied
+    std::vector<bool> inputs_copied_ahead(sched->n_splits, false);
+
     // with pipeline parallelism, upload the user inputs before submitting the splits, to not wait for this graph in a later split
     if (sched->n_copies > 1) {
         ggml_backend_sched_upload_user_inputs(sched);
@@ -2287,8 +2296,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             sync_prev_split();
         }
 
-        int n_copies_split = 0;
-
         // copy the input tensors to the split backend in three passes: user inputs first, then the outputs of
         // other splits, then the weights in host memory - last, so that the copy callback (the selective expert
         // copy, upstream #29943) can read the other inputs of the split, e.g. the ids.
@@ -2297,6 +2304,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // previous split has been queued on that stream, that synchronize blocks the host until the previous device
         // has finished its entire graph, serializing host and GPU at every split boundary.  upstream #28874
         static const bool no_input_reorder = getenv("GGML_SCHED_NO_INPUT_REORDER") != NULL;
+        auto copy_split_inputs = [&](struct ggml_backend_sched_split * split) -> int {
+        const int split_backend_id = split->backend_id;
+        int n_copies_split = 0;
         for (int pass = 0; pass < 3; pass++)
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
@@ -2340,10 +2350,51 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 copied.push_back({ input_cpy, input });
             }
         }
+        return n_copies_split;
+        };
+
+        // fork: a split that starts at a GGML_TENSOR_FLAG_SPLIT_BEFORE node copies the inputs of the NEXT split
+        // first, when that one runs on the CPU and takes nothing this one computes. The copy's synchronize of the
+        // source GPU then covers only the work queued before this split, and this split's kernels run while the
+        // CPU computes the next one (LLAMA_SHEXP_OVERLAP: the shared expert against the host-resident experts).
+        if (split_id + 1 < sched->n_splits && !inputs_copied_ahead[split_id] &&
+                (sched->graph.nodes[split->i_start]->flags & GGML_TENSOR_FLAG_SPLIT_BEFORE)) {
+            struct ggml_backend_sched_split * next = &splits[split_id + 1];
+            ggml_backend_dev_t next_dev = ggml_backend_get_device(sched->backends[next->backend_id]);
+            bool ok = next_dev && ggml_backend_dev_type(next_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            for (int k = 0; ok && k < next->n_inputs; k++) {
+                const struct ggml_tensor * in = next->inputs[k];
+                while (in->view_src) {
+                    in = in->view_src;
+                }
+                for (int j = 0; j < split->graph.n_nodes; j++) {
+                    if (split->graph.nodes[j] == in) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (ok) {
+                const int n = copy_split_inputs(next);
+                if (next->n_inputs > 0 && n == 0) {
+                    // every copy was skipped: the next split then has no barrier on the work before this split
+                    ggml_backend_synchronize(sched->backends[split_backend_id]);
+                }
+                inputs_copied_ahead[split_id + 1] = true;
+            }
+        }
+
+        if (inputs_copied_ahead[split_id]) {
+            // the inputs were copied before the previous split was submitted; that split takes none of them, so
+            // only the usual barrier against it remains
+            sync_prev_split();
+        } else {
+        const int n_copies_split = copy_split_inputs(split);
 
         if (split->n_inputs > 0 && n_copies_split == 0) {
             // every input copy was skipped, so none of them provided the barrier the copy path normally does
             sync_prev_split();
+        }
         }
 
         if (!sched->callback_eval) {

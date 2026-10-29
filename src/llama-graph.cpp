@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include <atomic>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -2157,6 +2159,27 @@ ggml_tensor * llm_graph_context::build_ffn(
 //   1 = GPU half keeps the ORIGINAL ids (mask still applied, so results stay correct) -> isolates the clamp
 //   2 = CPU half uses the clamped ids instead of the -1 sentinels -> isolates the sentinel
 // Mode 1 streams every expert and mode 2 makes the CPU compute every pair, so both are slow by design.
+static std::atomic<int> g_shexp_overlap{0};
+
+int llama_shexp_overlap_refresh() {
+    static const char * ctl = getenv("LLAMA_SHEXP_OVERLAP_CTL");
+    static const int    env = getenv("LLAMA_SHEXP_OVERLAP") ? (atoi(getenv("LLAMA_SHEXP_OVERLAP")) > 0) : 0;
+    int v = env;
+    if (ctl) {
+        v = 0;
+        if (FILE * f = fopen(ctl, "r")) {
+            v = fgetc(f) == '1';
+            fclose(f);
+        }
+    }
+    g_shexp_overlap.store(v, std::memory_order_relaxed);
+    return v;
+}
+
+int llama_shexp_overlap() {
+    return g_shexp_overlap.load(std::memory_order_relaxed);
+}
+
 static int moe_cpu_assist_mode() {
     static const int m = [] {
         const char * e = getenv("LLAMA_MOE_CPU_ASSIST_MODE");
@@ -2387,6 +2410,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // LLAMA_SHEXP_OVERLAP: at decode, a layer whose experts sit in host memory runs them on the CPU while the GPU
+    // idles. The model's shared expert does not depend on them, so it is emitted HERE - after the routing, before
+    // the expert matmuls - and its first node starts a split flagged GGML_TENSOR_FLAG_SPLIT_BEFORE. The scheduler
+    // then copies the CPU split's inputs (cur, ids, weights) before launching the shared expert, so the GPU
+    // computes it while the CPU computes the routed experts. Without the flag the copy's synchronize would wait
+    // for the shared expert too and nothing would overlap. Decode/verify sized batches only: at prefill the
+    // expert matmuls are offloaded to the GPU and there is no CPU split to overlap with.
+    if (moe_pre_experts && n_tokens <= 16 && up_exps && up_exps->buffer && ggml_backend_buffer_is_host(up_exps->buffer)) {
+        const int n0 = ggml_graph_n_nodes(gf);
+        moe_pre_experts();
+        for (int i = n0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor * t = ggml_graph_node(gf, i);
+            if (!ggml_is_view(t) && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+                t->flags |= GGML_TENSOR_FLAG_SPLIT_BEFORE;
+                break;
+            }
+        }
+    }
 
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);

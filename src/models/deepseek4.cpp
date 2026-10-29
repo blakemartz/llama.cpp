@@ -2890,6 +2890,24 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+        ggml_tensor * ffn_shexp = nullptr;
+        auto build_shexp = [&](bool expand) {
+            ffn_shexp = build_ffn(cur,
+                    layer.ffn_up_shexp, nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+            if (expand) {
+                ggml_build_forward_expand(gf, ffn_shexp);
+            }
+        };
+        // LLAMA_SHEXP_OVERLAP=1: build_moe_ffn emits the shared expert between the routing and the host-resident
+        // expert matmuls, so the GPU computes it while the CPU computes the routed experts (decode only)
+        if (llama_shexp_overlap()) {
+            moe_pre_experts = [&]() { build_shexp(true); };
+        }
+
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 layer.ffn_up_exps,
@@ -2902,13 +2920,11 @@ llama_model_deepseek4::graph_v41::graph_v41(const llama_model & model, const llm
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
                 il);
         cb(moe_out, "ffn_moe_out", il);
+        moe_pre_experts = nullptr;
 
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
+        if (ffn_shexp == nullptr) {
+            build_shexp(false);   // the original order: reached through the add below
+        }
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);

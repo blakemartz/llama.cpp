@@ -1018,6 +1018,13 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// fork: LLAMA_SHEXP_OVERLAP state. llama_shexp_overlap_refresh() re-reads it - from the file named by
+// LLAMA_SHEXP_OVERLAP_CTL when that is set (first byte '1' = on), so a bench can flip it on a running server,
+// else from the env var - and llama_shexp_overlap() returns the last value read. The context refreshes it before
+// each graph and rebuilds the graph when it changed; the model reads it while building.
+int llama_shexp_overlap_refresh();
+int llama_shexp_overlap();
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1077,6 +1084,10 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // fork: if set, build_moe_ffn calls this between the routing and the expert matmuls of a layer whose experts
+    // are host-resident (see LLAMA_SHEXP_OVERLAP in build_moe_ffn); the model builds its shared expert in it
+    std::function<void()> moe_pre_experts;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
