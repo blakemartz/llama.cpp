@@ -12253,6 +12253,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
     }
+    // MXFP8 dense shared expert (DeepSeek-V4.1): must not reach the fused mmvq path
+    for (bool b : {false, true}) {
+        for (int64_t m_batch : { 1, 6 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_MXFP8, GGML_GLU_OP_SWIGLU, m_batch, 32, 256,
+                false, 1, 1, b, false, true, false));
+        }
+    }
 
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and
     // columns on both sides of the 8 and 16 column tiles
