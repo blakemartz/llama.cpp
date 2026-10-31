@@ -119,6 +119,21 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// MXFP8: E4M3 codes with one E8M0 scale per 32; the decode is exact (E4M3 x 2^k is representable in F32).
+#define QR_MXFP8 1
+static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_mxfp8 * x = (const block_mxfp8 *) vx;
+
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(
+        (__nv_fp8x2_storage_t) (x[ib].qs[iqs + 0] | (x[ib].qs[iqs + 1] << 8)), __NV_E4M3);
+    const float2 f = __half22float2(*(const half2 *) &h);
+
+    v.x = f.x*d;
+    v.y = f.y*d;
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

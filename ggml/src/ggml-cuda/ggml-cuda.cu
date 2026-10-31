@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/mmv-mxfp8.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -1591,7 +1592,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc) ||
+            src0->type == GGML_TYPE_MXFP8; // F32 accumulation: MXFP8 weights are exact, keep the sum exact too
     } else if (compute_type == GGML_TYPE_BF16) {
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
@@ -1722,6 +1724,18 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = fast_bf16_hardware_available(cc) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
     } else if (prec == GGML_PREC_F32) {
         compute_type = GGML_TYPE_F32;
+    }
+
+    if (src0->type == GGML_TYPE_MXFP8) {
+        // The weights convert to F16 exactly (bar values below 2^-24) and the impl accumulates in F32 for this type.
+        // GGML_CUDA_MXFP8_COMPUTE=bf16 (exact weights, 8-bit activations) or f32 overrides.
+        static const char * env_mx = getenv("GGML_CUDA_MXFP8_COMPUTE");
+        compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        if (env_mx != nullptr && strcmp(env_mx, "bf16") == 0 && fast_bf16_hardware_available(cc)) {
+            compute_type = GGML_TYPE_BF16;
+        } else if (env_mx != nullptr && strcmp(env_mx, "f32") == 0) {
+            compute_type = GGML_TYPE_F32;
+        }
     }
 
     const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
@@ -1989,6 +2003,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     GGML_TENSOR_BINARY_OP_LOCALS
 
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+
+    // MXFP8 never goes through q8_1 activations: the vector kernel keeps them F32, larger batches use cuBLAS.
+    if (src0->type == GGML_TYPE_MXFP8) {
+        if (ggml_cuda_should_use_mmv_mxfp8(src0, src1, dst)) {
+            ggml_cuda_mul_mat_vec_mxfp8(ctx, src0, src1, dst);
+        } else {
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        }
         return;
     }
 
@@ -5900,6 +5924,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                         return true;
+                    case GGML_TYPE_MXFP8:
+                        return op->op == GGML_OP_MUL_MAT;
                     default:
                         return false;
                 }

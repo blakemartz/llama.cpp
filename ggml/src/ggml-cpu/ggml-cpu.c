@@ -212,6 +212,24 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+// MXFP8 x F32 (reference path; on this stack the MXFP8 dense weights run on CUDA). The activations stay F32.
+static void ggml_vec_dot_mxfp8_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+                                   const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    GGML_UNUSED(nrc); GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);
+    const block_mxfp8 * GGML_RESTRICT x = (const block_mxfp8 *) vx;
+    const float       * GGML_RESTRICT y = (const float *) vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n/QK_MXFP8; ++i) {
+        float b = 0.0f;
+        for (int j = 0; j < QK_MXFP8; ++j) {
+            b += ggml_e4m3_to_fp32(x[i].qs[j]) * y[i*QK_MXFP8 + j];
+        }
+        sum += b * GGML_E8M0_TO_FP32(x[i].e);
+    }
+    *s = sum;
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -290,6 +308,11 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
         .vec_dot_mcols            = ggml_vec_dot_mxfp4_q8_0_mcols,
+    },
+    [GGML_TYPE_MXFP8] = {
+        .vec_dot                  = ggml_vec_dot_mxfp8_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
     },
     [GGML_TYPE_NVFP4] = {
         .from_float               = quantize_row_nvfp4,

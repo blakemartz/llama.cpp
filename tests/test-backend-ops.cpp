@@ -11069,6 +11069,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    // MXFP8 dense (DeepSeek-V4.1 projections): vector kernel for n <= 8, cuBLAS F32-accumulate above
+    for (int n : {1, 2, 3, 5, 8, 9, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 1280, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 512, n, 1280, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 136, n, 2304, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 256, n, 4096, {8, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 256, n, 1024, {2, 3}, {2, 1}));
+    }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
@@ -12417,6 +12425,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // DeepSeek-V4.1 dense projections, MXFP8 vs Q8_0 (2026-10-30): wq_b, wo_b, wq_a, shexp down
+    for (ggml_type t : {GGML_TYPE_MXFP8, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 6, 1536}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 32768, n, 1280, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120,  n, 8192, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1280,  n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120,  n, 2304, {1, 1}, {1, 1}));
+        }
+        for (int n : {1, 2, 6, 8}) { // ~1 GB of weights: past the 72 MB L2, i.e. DRAM-bound like real decode
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 131072, n, 8192, {1, 1}, {1, 1}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
