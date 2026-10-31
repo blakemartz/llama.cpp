@@ -26,13 +26,14 @@ static __device__ __forceinline__ float4 mxfp8_decode4(const uint32_t q) {
 #endif // !defined(GGML_USE_HIP)
 }
 
-// Lane mapping: a row is ne00/4 four-value words; the T threads that share a row take words t, t+T, ... so the
-// activation loads of a warp are consecutive (coalesced). A word's four E4M3 codes straddle two aligned 32-bit
+// Lane mapping: a row is ne00/4 four-value words in groups of P (P divides 8, so a group never leaves its block);
+// the T threads that share a row take groups t, t+T, ... so the activation loads of a warp are consecutive
+// (coalesced). P > 1 loads and applies each block scale once per P words and reads P+1 aligned words for P. A word's four E4M3 codes straddle two aligned 32-bit
 // words (blocks are 33 bytes); both are read straight from global memory (L1 absorbs the overlap) and joined with
 // a funnel shift. The inner loop is unrolled 8x so the loads issue before their first use. A row group of R rows
 // reuses every activation load. splitk: all warps of the block share the R rows and split K (T = 32*nwarps),
 // otherwise each warp has its own rows (T = 32).
-template <int ncols_dst, int R, bool splitk>
+template <int ncols_dst, int R, bool splitk, int P>
 static __global__ void mul_mat_vec_mxfp8(
         const char * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
         const int ncols_x, const int nrows_x,
@@ -61,31 +62,49 @@ static __global__ void mul_mat_vec_mxfp8(
     }
 
     const int nwq = ncols_x/4;                                   // four-value words per row
+    const int ngq = nwq/P;                                       // P-word groups per row (P divides 8)
     float acc[R][ncols_dst] = {{0.0f}};
 
-    for (int q0 = 0; q0 < nwq; q0 += 8*T) {
+    for (int g0 = 0; g0 < ngq; g0 += 8*T) {
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const int q = q0 + i*T + t;
-            if (q >= nwq) {
+            const int g = g0 + i*T + t;
+            if (g >= ngq) {
                 break;
             }
-            float4 a[ncols_dst];
+            const int q = g*P;                                    // first word of the group
+            float4 a[ncols_dst][P];
 #pragma unroll
             for (int col = 0; col < ncols_dst; ++col) {
-                a[col] = *(const float4 *) (y + col*stride_col_y + 4*q);
+#pragma unroll
+                for (int j = 0; j < P; ++j) {
+                    a[col][j] = *(const float4 *) (y + col*stride_col_y + 4*(q + j));
+                }
             }
             const int bo = (q >> 3)*(int) sizeof(block_mxfp8);   // block byte offset in the row; scale byte first
-            const int eo = bo + 1 + 4*(q & 7);                    // this word's first E4M3 code
+            const int eo = bo + 1 + 4*(q & 7);                    // the group's first E4M3 code
+            const int sh = 8*(eo & 3);
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const float d = ggml_cuda_e8m0_to_fp32((uint8_t) ((__ldg(xr[r] + (bo >> 2)) >> (8*(bo & 3))) & 0xFF));
-                const uint32_t lo = __ldg(xr[r] + (eo >> 2));
-                const uint32_t hi = (eo & 3) ? __ldg(xr[r] + (eo >> 2) + 1) : 0; // aligned: never read past the row
-                const float4 v = mxfp8_decode4(__funnelshift_r(lo, hi, 8*(eo & 3)));
+                uint32_t w[P + 1];
+#pragma unroll
+                for (int j = 0; j < P; ++j) {
+                    w[j] = __ldg(xr[r] + (eo >> 2) + j);
+                }
+                w[P] = (eo & 3) ? __ldg(xr[r] + (eo >> 2) + P) : 0; // aligned: never read past the row
+                float s[ncols_dst] = {0.0f};
+#pragma unroll
+                for (int j = 0; j < P; ++j) {
+                    const float4 v = mxfp8_decode4(__funnelshift_r(w[j], w[j + 1], sh));
+#pragma unroll
+                    for (int col = 0; col < ncols_dst; ++col) {
+                        s[col] += v.x*a[col][j].x + v.y*a[col][j].y + v.z*a[col][j].z + v.w*a[col][j].w;
+                    }
+                }
 #pragma unroll
                 for (int col = 0; col < ncols_dst; ++col) {
-                    acc[r][col] += d*(v.x*a[col].x + v.y*a[col].y + v.z*a[col].z + v.w*a[col].w);
+                    acc[r][col] += d*s[col];
                 }
             }
         }
@@ -134,18 +153,21 @@ bool ggml_cuda_should_use_mmv_mxfp8(const ggml_tensor * src0, const ggml_tensor 
         src1->ne[2] <= 65535 && src1->ne[3] <= 65535;
 }
 
-struct mmv_mxfp8_cfg { int R, W; bool splitk; };
+struct mmv_mxfp8_cfg { int R, W; bool splitk; int P; };
 
-// Defaults from the 2026-10-30 sweep (1 GB DRAM-bound GEMV, GB10 and 4090): 8 warps splitting K, 1 row per
-// block for one column and 4 rows (activation reuse) for more; Ada wants 4 warps there (4090: 1221 vs 1479 us). MXFP8_MMV_CFG="R,W,S" (rows per group, warps per
-// block, split-K 0/1) overrides both for tuning.
+// Defaults from the 2026-10-30 sweep at this model's dense shapes (m x k = 32768x1280, 5120x8192, 1280x5120,
+// 5120x2304; n = 1 and 6). Ada: 2 warps x 4 rows, 4 words per lane at n = 1 (sum 42 vs 90 us for the first
+// lane-per-word kernel; Q8_0 mmvq 51), 2 words per lane at n > 1. GB10 (DRAM-bound at these sizes): 4 warps x
+// 4 rows, 4 words per lane (n = 1: 404 vs 486 us, Q8_0 391). MXFP8_MMV_CFG="R,W,S[,P]" (rows per group, warps per
+// block, split-K 0/1, words per lane 1/2/4) overrides both for tuning.
 static mmv_mxfp8_cfg mmv_mxfp8_get_cfg(const int ncols_dst, const int cc) {
     static const mmv_mxfp8_cfg env = [] {
-        mmv_mxfp8_cfg c = {0, 0, false};
+        mmv_mxfp8_cfg c = {0, 0, false, 1};
         if (const char * e = getenv("MXFP8_MMV_CFG")) {
-            int r = 2, w = 4, sk = 0;
-            if (sscanf(e, "%d,%d,%d", &r, &w, &sk) == 3 && (r == 1 || r == 2 || r == 4) && w >= 1 && w <= MMV_MXFP8_MAX_WARPS) {
-                c = {r, w, sk != 0};
+            int r = 2, w = 4, sk = 0, p = 1;
+            if (sscanf(e, "%d,%d,%d,%d", &r, &w, &sk, &p) >= 3 && (r == 1 || r == 2 || r == 4) && w >= 1 && w <= MMV_MXFP8_MAX_WARPS &&
+                (p == 1 || p == 2 || p == 4)) {
+                c = {r, w, sk != 0, p};
             }
         }
         return c;
@@ -153,19 +175,19 @@ static mmv_mxfp8_cfg mmv_mxfp8_get_cfg(const int ncols_dst, const int cc) {
     if (env.R != 0) {
         return env;
     }
-    if (ncols_dst == 1) {
-        return {1, 8, true};
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL) {
+        return {4, 4, true, 4};
     }
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL ? mmv_mxfp8_cfg{4, 8, true} : mmv_mxfp8_cfg{4, 4, true};
+    return ncols_dst == 1 ? mmv_mxfp8_cfg{4, 2, true, 4} : mmv_mxfp8_cfg{4, 2, true, 2};
 }
 
-template <int ncols_dst, int R, bool splitk>
+template <int ncols_dst, int R, bool splitk, int P>
 static void launch_mul_mat_vec_mxfp8_rk(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int W, cudaStream_t stream) {
     const int64_t nrows = src0->ne[1];
     const int64_t rows_per_block = splitk ? R : R*W;
     const dim3 grid((nrows + rows_per_block - 1)/rows_per_block, src1->ne[2], src1->ne[3]);
     const dim3 block(WARP_SIZE, W, 1);
-    mul_mat_vec_mxfp8<ncols_dst, R, splitk><<<grid, block, 0, stream>>>(
+    mul_mat_vec_mxfp8<ncols_dst, R, splitk, P><<<grid, block, 0, stream>>>(
         (const char *) src0->data, (const float *) src1->data, (float *) dst->data,
         src0->ne[0], nrows,
         src0->nb[1], src1->nb[1]/sizeof(float), dst->nb[1]/sizeof(float),
@@ -174,16 +196,26 @@ static void launch_mul_mat_vec_mxfp8_rk(const ggml_tensor * src0, const ggml_ten
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <int ncols_dst, int R, bool splitk>
+static void launch_mul_mat_vec_mxfp8_p(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const mmv_mxfp8_cfg & c, cudaStream_t stream) {
+    switch (c.P) {
+        case 1: launch_mul_mat_vec_mxfp8_rk<ncols_dst, R, splitk, 1>(src0, src1, dst, c.W, stream); break;
+        case 2: launch_mul_mat_vec_mxfp8_rk<ncols_dst, R, splitk, 2>(src0, src1, dst, c.W, stream); break;
+        case 4: launch_mul_mat_vec_mxfp8_rk<ncols_dst, R, splitk, 4>(src0, src1, dst, c.W, stream); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
 template <int ncols_dst>
 static void launch_mul_mat_vec_mxfp8(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const int cc, cudaStream_t stream) {
     const mmv_mxfp8_cfg c = mmv_mxfp8_get_cfg(ncols_dst, cc);
     switch (c.R*2 + c.splitk) {
-        case 2: launch_mul_mat_vec_mxfp8_rk<ncols_dst, 1, false>(src0, src1, dst, c.W, stream); break;
-        case 3: launch_mul_mat_vec_mxfp8_rk<ncols_dst, 1, true >(src0, src1, dst, c.W, stream); break;
-        case 4: launch_mul_mat_vec_mxfp8_rk<ncols_dst, 2, false>(src0, src1, dst, c.W, stream); break;
-        case 5: launch_mul_mat_vec_mxfp8_rk<ncols_dst, 2, true >(src0, src1, dst, c.W, stream); break;
-        case 8: launch_mul_mat_vec_mxfp8_rk<ncols_dst, 4, false>(src0, src1, dst, c.W, stream); break;
-        case 9: launch_mul_mat_vec_mxfp8_rk<ncols_dst, 4, true >(src0, src1, dst, c.W, stream); break;
+        case 2: launch_mul_mat_vec_mxfp8_p<ncols_dst, 1, false>(src0, src1, dst, c, stream); break;
+        case 3: launch_mul_mat_vec_mxfp8_p<ncols_dst, 1, true >(src0, src1, dst, c, stream); break;
+        case 4: launch_mul_mat_vec_mxfp8_p<ncols_dst, 2, false>(src0, src1, dst, c, stream); break;
+        case 5: launch_mul_mat_vec_mxfp8_p<ncols_dst, 2, true >(src0, src1, dst, c, stream); break;
+        case 8: launch_mul_mat_vec_mxfp8_p<ncols_dst, 4, false>(src0, src1, dst, c, stream); break;
+        case 9: launch_mul_mat_vec_mxfp8_p<ncols_dst, 4, true >(src0, src1, dst, c, stream); break;
         default: GGML_ABORT("fatal error");
     }
 }
