@@ -1521,14 +1521,43 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const cuda_t * src0_ptr = nullptr;
     const cuda_t * src1_ptr = nullptr;
 
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    bool prefer_f32_output = false;
+    if (compute_type == GGML_TYPE_F16) {
+        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc) ||
+            src0->type == GGML_TYPE_MXFP8; // F32 accumulation: MXFP8 weights are exact, keep the sum exact too
+    } else if (compute_type == GGML_TYPE_BF16) {
+        prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+    }
+
     ggml_cuda_pool_alloc<cuda_t> src0_alloc(ctx.pool());
     ggml_cuda_pool_alloc<cuda_t> src1_alloc(ctx.pool());
+
+    // MXFP8 weights past the vector kernel: a converted copy of the whole matrix would set the pool's peak (up to
+    // 80 MiB, held for the life of the context). Convert and multiply blocks of rows instead, into one small buffer.
+    // GGML_CUDA_MXFP8_CHUNK_MB sets the block size (default 16, 0 = whole matrix).
+    int64_t mx_rows = ne01;
+    if (src0->type == GGML_TYPE_MXFP8 && compute_type != GGML_TYPE_F32 && prefer_f32_output &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ggml_is_contiguously_allocated(src0)) {
+        static const int64_t chunk_bytes = [] {
+            const char * env = getenv("GGML_CUDA_MXFP8_CHUNK_MB");
+            return (int64_t) (env != nullptr ? atoi(env) : 16) << 20;
+        }();
+        if (chunk_bytes > 0) {
+            mx_rows = std::max<int64_t>(128, chunk_bytes / (ne00*(int64_t) sizeof(cuda_t)) / 128 * 128);
+            mx_rows = std::min(mx_rows, ne01);
+        }
+    }
 
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
+    } else if (mx_rows < ne01) {
+        src0_alloc.alloc(mx_rows*ne00); // filled block by block at the GEMM below
+        s01 = ne00;
+        src0_ptr = src0_alloc.get();
     } else {
         src0_alloc.alloc(ggml_nelements(src0));
 
@@ -1589,15 +1618,6 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const void * alpha = traits::get_alpha();
     const void * beta = traits::get_beta();
 
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    bool prefer_f32_output = false;
-    if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc) ||
-            src0->type == GGML_TYPE_MXFP8; // F32 accumulation: MXFP8 weights are exact, keep the sum exact too
-    } else if (compute_type == GGML_TYPE_BF16) {
-        prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
-    }
-
     if (prefer_f32_output) {
         dst_ptr = (char *) dst_ddf;
         cu_compute_type = batched_mul_mat_traits<GGML_TYPE_F32>::compute_type;
@@ -1631,6 +1651,21 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                     (const float *) alpha, (const float *) src0_ptr, s01,
                                            (const float *) src1_ptr, s11,
                     (const float *) beta,  (float       *)  dst_ptr, ldc));
+    } else if (mx_rows < ne01) {
+        const auto convert_func = traits::convert(src0->type);
+        GGML_ASSERT(convert_func != nullptr);
+        for (int64_t i01 = 0; i01 < ne01; i01 += mx_rows) {
+            const int64_t nr = std::min(mx_rows, ne01 - i01);
+            convert_func((const char *) src0->data + i01*nb01, src0_alloc.get(), nr*ne00, main_stream);
+            CUBLAS_CHECK(
+                cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nr, ne11, ne10,
+                        alpha, src0_ptr, cu_data_type_a, s01,
+                               src1_ptr, cu_data_type_b, s11,
+                        beta,  (float *) dst_ptr + i01, cu_data_type, ldc,
+                        cu_compute_type,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
     } else if (ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
