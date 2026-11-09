@@ -1535,8 +1535,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     // MXFP8 weights past the vector kernel: a converted copy of the whole matrix sets the pool's peak (up to
     // 80 MiB, held for the life of the context). GGML_CUDA_MXFP8_CHUNK_MB=N converts and multiplies N MiB blocks of
-    // rows instead. Opt-in: at 16 MiB it saved 158 MiB on CUDA0 but cost 10 % prefill on the 4090s (DeepSeek-V4.1,
-    // 2026-11-08), and the smaller GEMMs change the F32 summation order.
+    // rows instead. Opt-in: at 16 MiB it saved 158 MiB on CUDA0 and did not stop the allocator's OOM retries; prefill
+    // at 24.6K was 827 vs 917 t/s in one A/B pair (equal at 3K), and the smaller GEMMs change the F32 summation order.
     int64_t mx_rows = ne01;
     if (src0->type == GGML_TYPE_MXFP8 && compute_type != GGML_TYPE_F32 && prefer_f32_output &&
             ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ggml_is_contiguously_allocated(src0)) {
