@@ -1533,15 +1533,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     ggml_cuda_pool_alloc<cuda_t> src0_alloc(ctx.pool());
     ggml_cuda_pool_alloc<cuda_t> src1_alloc(ctx.pool());
 
-    // MXFP8 weights past the vector kernel: a converted copy of the whole matrix would set the pool's peak (up to
-    // 80 MiB, held for the life of the context). Convert and multiply blocks of rows instead, into one small buffer.
-    // GGML_CUDA_MXFP8_CHUNK_MB sets the block size (default 16, 0 = whole matrix).
+    // MXFP8 weights past the vector kernel: a converted copy of the whole matrix sets the pool's peak (up to
+    // 80 MiB, held for the life of the context). GGML_CUDA_MXFP8_CHUNK_MB=N converts and multiplies N MiB blocks of
+    // rows instead. Opt-in: at 16 MiB it saved 158 MiB on CUDA0 but cost 10 % prefill on the 4090s (DeepSeek-V4.1,
+    // 2026-11-08), and the smaller GEMMs change the F32 summation order.
     int64_t mx_rows = ne01;
     if (src0->type == GGML_TYPE_MXFP8 && compute_type != GGML_TYPE_F32 && prefer_f32_output &&
             ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ggml_is_contiguously_allocated(src0)) {
         static const int64_t chunk_bytes = [] {
             const char * env = getenv("GGML_CUDA_MXFP8_CHUNK_MB");
-            return (int64_t) (env != nullptr ? atoi(env) : 16) << 20;
+            return (int64_t) (env != nullptr ? atoi(env) : 0) << 20;
         }();
         if (chunk_bytes > 0) {
             mx_rows = std::max<int64_t>(128, chunk_bytes / (ne00*(int64_t) sizeof(cuda_t)) / 128 * 128);
